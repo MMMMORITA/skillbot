@@ -40,11 +40,18 @@ def _get_spark():
     return _spark
 
 
+def _job_tag(job_id: str) -> str:
+    return f"skillbot-job-{job_id}"
+
+
 def _run_query(job_id: str, sql: str) -> None:
     rec = _query_store[job_id]
+    spark = None
     try:
         spark = _get_spark()
-        spark.sparkContext.setJobGroup(job_id, sql)
+        # Spark Connect has no JVM sparkContext; tag the session's work so it
+        # can be interrupted by tag (Connect's job-group equivalent).
+        spark.addTag(_job_tag(job_id))
         df = spark.sql(sql)
         rec["df"] = df
         rec["result"] = df.collect()
@@ -52,6 +59,12 @@ def _run_query(job_id: str, sql: str) -> None:
     except Exception as e:
         rec["error"] = str(e)
         rec["status"] = "FAILED"
+    finally:
+        if spark is not None:
+            try:
+                spark.removeTag(_job_tag(job_id))
+            except Exception:
+                pass
 
 
 # ----------------------------------------------------------------
@@ -200,7 +213,7 @@ async def spark_cancel_job(params: dict) -> ToolResult:
 
     try:
         spark = _get_spark()
-        spark.sparkContext.cancelJobGroup(job_id)
+        spark.interruptTag(_job_tag(job_id))
     except Exception as e:
         return ToolResult(error=str(e))
     rec["status"] = "CANCELLED"

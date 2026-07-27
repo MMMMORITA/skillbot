@@ -202,6 +202,73 @@ class TestRegression:
         assert isinstance(_p(text).text, str)
 
 
+# ============================================================
+# Decision gate
+# ============================================================
+
+class TestDecisionGate:
+    def test_absent_is_none(self):
+        assert _p('```json\n{"text": "ok"}\n```').decision_gate is None
+
+    def test_plain_text_is_none(self):
+        assert _p("just text").decision_gate is None
+
+    def test_full_gate(self):
+        r = _p('```json\n{"decision_gate": {"type": "scope", "question": "Which metric?", '
+               '"options": [{"label": "DAU", "evidence": "log-based", "recommended": true}, '
+               '{"label": "MAU", "evidence": "warehouse"}]}}\n```')
+        g = r.decision_gate
+        assert g is not None
+        assert g["type"] == "scope"
+        assert g["question"] == "Which metric?"
+        assert len(g["options"]) == 2
+        assert g["options"][0] == {"label": "DAU", "evidence": "log-based", "recommended": True}
+        assert g["options"][1] == {"label": "MAU", "evidence": "warehouse", "recommended": False}
+
+    def test_type_defaults_to_direction(self):
+        r = _p('```json\n{"decision_gate": {"options": [{"label": "A"}]}}\n```')
+        assert r.decision_gate["type"] == "direction"
+
+    def test_option_defaults(self):
+        r = _p('```json\n{"decision_gate": {"options": [{"label": "A"}]}}\n```')
+        assert r.decision_gate["options"][0] == {"label": "A", "evidence": "", "recommended": False}
+
+    def test_missing_options_ignored(self):
+        r = _p('```json\n{"decision_gate": {"type": "gain", "question": "?"}}\n```')
+        assert r.decision_gate is None
+
+    def test_empty_options_ignored(self):
+        r = _p('```json\n{"decision_gate": {"options": []}}\n```')
+        assert r.decision_gate is None
+
+    def test_options_without_labels_ignored(self):
+        r = _p('```json\n{"decision_gate": {"options": [{"evidence": "x"}, {"label": "  "}]}}\n```')
+        assert r.decision_gate is None
+
+    def test_options_not_list_ignored(self):
+        r = _p('```json\n{"decision_gate": {"options": "nope"}}\n```')
+        assert r.decision_gate is None
+
+    def test_gate_not_object_ignored(self):
+        r = _p('```json\n{"decision_gate": "just a string"}\n```')
+        assert r.decision_gate is None
+
+    def test_non_dict_options_skipped(self):
+        r = _p('```json\n{"decision_gate": {"options": ["skip", {"label": "keep"}]}}\n```')
+        assert r.decision_gate is not None
+        assert len(r.decision_gate["options"]) == 1
+        assert r.decision_gate["options"][0]["label"] == "keep"
+
+    def test_gate_coexists_with_text(self):
+        r = _p('```json\n{"text": "context", "decision_gate": {"options": [{"label": "A"}]}}\n```')
+        assert r.text == "context"
+        assert r.decision_gate is not None
+
+    def test_invalid_json_gate_falls_back(self):
+        r = _p("```json\n{broken decision_gate\n```")
+        assert r.decision_gate is None
+
+
 class TestMarkdownDetection:
     def test_heading_detected(self):
         r = _p('```json\n{"text": "## Title\\ncontent"}\n```')

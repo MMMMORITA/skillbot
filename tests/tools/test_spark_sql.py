@@ -61,6 +61,17 @@ class MockSparkContext:
 class MockSpark:
     def __init__(self):
         self.sparkContext = MockSparkContext()
+        self.tags = set()
+        self.interrupted = []
+
+    def addTag(self, tag):
+        self.tags.add(tag)
+
+    def removeTag(self, tag):
+        self.tags.discard(tag)
+
+    def interruptTag(self, tag):
+        self.interrupted.append(tag)
 
     def sql(self, sql):
         return MockDataFrame(
@@ -181,6 +192,58 @@ class TestSparkCancel:
         t = ToolRegistry.get("spark_cancel_job")
         result = asyncio.run(t.execute({"job_id": "nonexistent"}))
         assert result.error is not None
+
+
+class TestSparkConnectCompat:
+    """Spark Connect sessions have no JVM ``sparkContext`` — the tool must use
+    tag-based job control (addTag/interruptTag), not ``sparkContext.setJobGroup``.
+    """
+
+    def test_run_query_uses_tags_not_sparkcontext(self):
+        import tools.builtin.spark_sql as mod
+
+        submit = ToolRegistry.get("spark_submit_query")
+        r = asyncio.run(submit.execute({"sql": "SELECT 1"}))
+        job_id = r.data["data"]["job_id"]
+        mod._query_store[job_id]["thread"].join(timeout=5)
+
+        # query completed via tag path (no sparkContext dependency)
+        assert mod._query_store[job_id]["status"] == "FINISHED"
+        # tag is cleaned up after the run
+        assert mod._job_tag(job_id) not in mod._spark.tags
+
+    def test_run_query_survives_connect_session(self):
+        """A session exposing only Connect APIs (no sparkContext) must not fail."""
+        import tools.builtin.spark_sql as mod
+
+        class ConnectOnlySpark(MockSpark):
+            def __init__(self):
+                self.tags = set()
+                self.interrupted = []
+
+            @property
+            def sparkContext(self):
+                raise AttributeError(
+                    "Attribute `sparkContext` is not supported in Spark Connect")
+
+        mod._spark = ConnectOnlySpark()
+        submit = ToolRegistry.get("spark_submit_query")
+        r = asyncio.run(submit.execute({"sql": "SELECT 1"}))
+        job_id = r.data["data"]["job_id"]
+        mod._query_store[job_id]["thread"].join(timeout=5)
+        assert mod._query_store[job_id]["status"] == "FINISHED"
+
+    def test_cancel_interrupts_by_tag(self):
+        import tools.builtin.spark_sql as mod
+
+        submit = ToolRegistry.get("spark_submit_query")
+        cancel = ToolRegistry.get("spark_cancel_job")
+        r = asyncio.run(submit.execute({"sql": "SELECT 1"}))
+        job_id = r.data["data"]["job_id"]
+        mod._query_store[job_id]["status"] = "RUNNING"
+
+        asyncio.run(cancel.execute({"job_id": job_id}))
+        assert mod._job_tag(job_id) in mod._spark.interrupted
 
 
 ToolRegistry.clear()

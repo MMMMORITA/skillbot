@@ -40,6 +40,7 @@ class ParsedResult:
     files: list[str] = field(default_factory=list)
     code_list: list[str] = field(default_factory=list)
     plan: str = ""
+    decision_gate: dict | None = None
     is_markdown: bool = False
 
 
@@ -89,9 +90,48 @@ def _from_json(data: dict) -> ParsedResult:
     elif isinstance(code_raw, str) and code_raw.strip():
         result.code_list = [code_raw.strip()]
     result.files = [str(f) for f in data.get("files", [])]
+    result.decision_gate = _normalize_gate(data.get("decision_gate"))
     if result.text:
         result.is_markdown = _has_markdown(result.text)
     return result
+
+
+def _normalize_gate(raw) -> dict | None:
+    """Validate a decision_gate object; return normalized dict or None.
+
+    A gate is only honored when it carries at least one option with a label —
+    otherwise the frontend would render an empty, un-actionable card. Malformed
+    gates are dropped (logged), never raised.
+    """
+    if not isinstance(raw, dict):
+        if raw is not None:
+            _log.warning("parse: decision_gate is %s, not object — ignored", type(raw).__name__)
+        return None
+    opts_raw = raw.get("options")
+    if not isinstance(opts_raw, list) or not opts_raw:
+        _log.warning("parse: decision_gate has no options list — ignored")
+        return None
+    options: list[dict] = []
+    for o in opts_raw:
+        if not isinstance(o, dict):
+            continue
+        label = str(o.get("label", "")).strip()
+        if not label:
+            continue
+        options.append({
+            "label": label,
+            "evidence": str(o.get("evidence", "")).strip(),
+            "recommended": bool(o.get("recommended", False)),
+        })
+    if not options:
+        _log.warning("parse: decision_gate options all empty — ignored")
+        return None
+    gtype = str(raw.get("type", "")).strip() or "direction"
+    return {
+        "type": gtype,
+        "question": str(raw.get("question", "")).strip(),
+        "options": options,
+    }
 
 
 def _from_code_fence_or_text(text: str) -> ParsedResult:

@@ -18,7 +18,16 @@ SECTIONS = {
         "- Code for the user to see and run MUST go in the \"code\" field, NEVER executed via Bash.\n"
         "- Use Bash for: file operations, data fetching, dependency installation, running tools.\n"
         "- Save generated files (charts, CSVs) to /tmp/ — they will be loaded into the notebook.\n"
-        "- If the user needs to see output, return it in \"text\" — do not print to stdout via Bash."
+        "- If the user needs to see output, return it in \"text\" — do not print to stdout via Bash.\n"
+        "- The analysis/model/pipeline code the user asked for is a DELIVERABLE for the notebook: put it "
+        "in \"code\" so it renders as cells the user's kernel runs. NEVER dump it into a standalone .py "
+        "file (and never under the user's home dir — only /tmp/ is allowed for tool outputs) and then ask "
+        "the user to run it. That kernel IS the runtime; you never need the user to execute anything by hand.\n"
+        "- Your ONLY tools are the ones actually provided this session (Bash, Write, Read and the magics "
+        "below). NEVER claim to have — or to be blocked from — tools that were not given to you "
+        "(e.g. execute_code, delegate_task, cronjob, skill_manage). If a tool call fails, report the real "
+        "error verbatim; do NOT invent a policy/sandbox/approval restriction, and do NOT offload the work "
+        "to the user as a workaround. When unsure whether you can do something, try it and surface the result."
     ),
     "magic": (
         "Available Jupyter magic commands (include in \"code\" when relevant):\n"
@@ -52,7 +61,33 @@ SECTIONS = {
         '- "files": file paths created by tools (optional).\n'
         '- "code": array of strings (optional). Each element → new Jupyter cell. Always use array format, even for single code blocks. '
         'For multi-part queries, put each independent task in its own code element — never merge unrelated logic into one cell.\n'
+        '- "decision_gate": OPTIONAL. Emit ONLY when the next step needs a human judgement that '
+        'you should not make alone (see the gate rules below). When present, do NOT also emit "code" — '
+        'stop and wait for the human choice.\n'
         'Include only non-empty fields.'
+    ),
+    "decision_gate": (
+        "Decision gates — hand judgement back to the human at the right moments.\n"
+        "When you hit a point where a human must decide (not you), emit a \"decision_gate\" object "
+        "instead of guessing or executing:\n"
+        '```json\n'
+        '{\n'
+        '  "decision_gate": {\n'
+        '    "type": "scope | direction | gain | launch",\n'
+        '    "question": "one-line question for the human",\n'
+        '    "options": [\n'
+        '      {"label": "short choice", "evidence": "the data/reason behind this option", "recommended": true}\n'
+        '    ]\n'
+        '  }\n'
+        '}\n'
+        '```\n'
+        "Gate types (trigger → what to put in options):\n"
+        "- scope (口径确认): a metric/field is ambiguous → each option = one interpretation + its SQL/definition diff.\n"
+        "- direction (方向选择): multiple patterns/approaches surfaced → each option = one direction + evidence + rough estimate.\n"
+        "- gain (增益判断): a preliminary result is in → options frame whether it is worth doing (gain size vs cost/risk).\n"
+        "- launch (上线决策): a rule/model output is ready → options cover effect + blast radius + rollback.\n"
+        "Rules: 2-4 options; every option MUST carry concrete evidence; mark at most one recommended=true; "
+        "the question must be answerable by picking one option. Emit at most one gate per response and no \"code\" alongside it."
     ),
     "tool_usage": (
         "Tool constraints:\n"
@@ -61,18 +96,37 @@ SECTIONS = {
         "- Write → only /tmp/ outputs that persist across tool calls.\n"
         "- Never execute user-facing code — always return it in \"code\" field."
     ),
-    "plan": (
-        "You are in plan mode. For EVERY request:\n"
-        "- Output your analysis plan in the \"plan\" JSON field as markdown. Do NOT execute.\n"
-        '- End your response with "code": "%confirm yes" for user confirmation.\n'
-        "- Only proceed to execution after the user confirms.\n"
-        '- If the user provides feedback, adjust your plan and output an updated "plan" field.'
+    "pipeline": (
+        "Execution mode: PIPELINE (deterministic, low-interruption).\n"
+        "- The request is well-scoped. Proceed directly toward a concrete result — do NOT stop to "
+        "brainstorm options the user did not ask for.\n"
+        "- For complex multi-step tasks, you may briefly state your approach in \"plan\", but keep "
+        "moving: put the executable work in \"code\".\n"
+        "- Only pause with a \"decision_gate\" at a GENUINE human judgement point (an ambiguous metric "
+        "definition, an irreversible launch, a surprising gain trade-off). Do not manufacture gates "
+        "for routine choices you can reasonably make yourself.\n"
+        "- CRITICAL: the MOMENT you would ask the human to pick between alternatives — anything phrased "
+        "as \"A or B?\", \"你选 A 还是 B\", \"which approach\", \"要不要\" — you MUST express it as a "
+        "structured \"decision_gate\" object, NEVER as a plain question in \"text\". A gate makes each "
+        "option's evidence and downstream path explicit; a prose question does not. If you catch yourself "
+        "writing a choice into \"text\", convert it to a decision_gate instead.\n"
+        "- CRITICAL: if you still need an input from the human to run the code — a file path, a column "
+        "name, a threshold, a value — ask for it in \"text\" and emit NO \"code\" that depends on it "
+        "this turn. Never generate cells that reference information you are simultaneously asking for; "
+        "wait for the answer, then generate the code. A \"Generate and execute cells?\" prompt should "
+        "only ever appear when the code is actually runnable as written.\n"
+        "- Default to finishing the task; hand judgement back only when you truly should not decide alone."
     ),
-    "plan_optional": (
-        "For complex multi-step tasks, briefly describe your approach before execution.\n"
-        "If you choose to plan first, output the plan in the \"plan\" JSON field and include "
-        '"code": "%confirm yes" so the user can confirm before you execute.\n'
-        "For simple single requests, proceed directly without planning."
+    "exploration": (
+        "Execution mode: EXPLORATION (options + evidence, judgement stays with the human).\n"
+        "- Your deliverable is a DECISION for the human to make, not a finished result. Do NOT write or "
+        "execute task code until a direction is chosen.\n"
+        "- Investigate the request, gather evidence, then surface the real forks in the road.\n"
+        "- When you reach a point where the human should choose, emit a \"decision_gate\" with 2-4 options, "
+        "each carrying concrete evidence (data, definition diff, rough estimate, blast radius). Mark at "
+        "most one recommended.\n"
+        "- Prefer a gate over guessing. If no genuine fork exists yet, keep exploring and report findings "
+        "in \"text\" — but bias strongly toward presenting options rather than committing to one."
     ),
     "file_explanation": (
         "File paths in \"files\" are auto-processed: "
@@ -89,10 +143,11 @@ class PromptBuilder:
         [
             SECTIONS["role"],
             "",  # claude_md placeholder (injected dynamically)
-            SECTIONS["plan_optional"],
+            SECTIONS["pipeline"],  # execution-mode placeholder (swapped by main(mode=...))
             SECTIONS["jupyter"],
             SECTIONS["magic"],
             SECTIONS["output"],
+            SECTIONS["decision_gate"],
             SECTIONS["tool_usage"],
         ]
     )
@@ -111,12 +166,30 @@ class PromptBuilder:
 
     # ---- public API ----
 
+    # Execution modes: the deliberate posture the agent takes for a session.
+    # "pipeline" is the default (baked into _main_static); "exploration" swaps it in.
+    MODES = ("pipeline", "exploration")
+
     @classmethod
-    def main(cls, claude_md_path: str | None = None, plan_mode: bool = False) -> str:
-        """Full prompt for main agent: static sections + claude_md + dynamic info."""
+    def main(
+        cls,
+        claude_md_path: str | None = None,
+        plan_mode: bool = False,
+        mode: str | None = None,
+    ) -> str:
+        """Full prompt for main agent: static sections + claude_md + dynamic info.
+
+        ``mode`` selects the execution posture: "pipeline" (default, deterministic)
+        or "exploration" (options + evidence, gate-driven). ``plan_mode=True`` is a
+        backward-compat alias that maps to "exploration".
+        """
+        if mode is None:
+            mode = "exploration" if plan_mode else "pipeline"
+        if mode not in cls.MODES:
+            mode = "pipeline"
         parts = [cls._main_static]
-        if plan_mode:
-            parts[0] = parts[0].replace(SECTIONS["plan_optional"], SECTIONS["plan"])
+        if mode != "pipeline":
+            parts[0] = parts[0].replace(SECTIONS["pipeline"], SECTIONS[mode])
         if claude_md_path:
             try:
                 content = Path(claude_md_path).read_text()

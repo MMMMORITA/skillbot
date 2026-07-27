@@ -123,3 +123,9 @@ config.yaml
 settings.json
 jupyter_agent.yaml
 conf/claude.md
+
+### Local-only dev/ops CLIs (not shipped to prod) ###
+.jdk/
+scripts/kexec.py
+scripts/rexec.py
+scripts/violations.py

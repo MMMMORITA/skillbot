@@ -3,6 +3,7 @@
 import hashlib
 import logging
 import os as _os
+import re
 import shlex
 import sys
 import time
@@ -31,6 +32,30 @@ _INTERRUPT_NOTE = (
     "Completely disregard the prior exchange — do NOT continue, reference, or respond to it. "
     "Respond ONLY to the current prompt below as if starting fresh.]"
 )
+
+# Frontend UI mode (default/plan/auto) → execution posture baked into the prompt.
+# plan is exploratory (surface options); default/auto drive deterministically.
+_UI_MODE_TO_EXEC = {
+    "plan": "exploration",
+    "auto": "pipeline",
+    "default": "pipeline",
+}
+
+# Per-turn directive prefixes — let a mid-session Shift+Tab switch take effect
+# without rebuilding the session's system prompt.
+_EXEC_MODE_DIRECTIVE = {
+    "exploration": (
+        "[System: EXPLORATION mode. Your deliverable is a decision for the human, not a finished "
+        "result. Investigate, gather evidence, and surface the real forks as a decision_gate "
+        "(2-4 options, each with concrete evidence). Do NOT write or execute task code until a "
+        "direction is chosen.]\n\n"
+    ),
+    "pipeline": (
+        "[System: PIPELINE mode. The request is well-scoped — proceed directly to a concrete "
+        "result. Only emit a decision_gate at a genuine human judgement point; otherwise finish "
+        "the task.]\n\n"
+    ),
+}
 
 SUB_AGENT_DEFAULTS = {
     "code_review": SubAgentConfig(
@@ -124,8 +149,82 @@ def _panel_track_cell_delete(source: str) -> None:
         inst.ns.remove_cell(source)
 
 
-def _merge_prompt(claude_md_path: str | None = None) -> str:
-    return PromptBuilder.main(claude_md_path)
+def _panel_save_conversation(nb_path: str, payload: str) -> None:
+    """Bridge: persist a notebook's conversation buffer to disk."""
+    from jupyter.conversation_store import save_conversation
+    save_conversation(nb_path, payload)
+
+
+def _panel_load_conversation(nb_path: str) -> None:
+    """Bridge: load a persisted conversation buffer and push it to the panel.
+
+    Emits a ``restore_conversation`` comm action the frontend listens for.
+    """
+    from jupyter.conversation_store import load_conversation
+    from jupyter.panel import send_to_panel
+    payload = load_conversation(nb_path)
+    if payload:
+        send_to_panel(None, "restore_conversation", path=nb_path, buffer=payload)
+
+
+def _panel_list_conversations() -> None:
+    """Bridge: push the list of persisted conversations to the panel switcher."""
+    from jupyter.conversation_store import list_conversations
+    from jupyter.panel import send_to_panel
+    send_to_panel(None, "conversation_list", sessions=list_conversations())
+
+
+def _panel_delete_conversation(nb_path: str) -> None:
+    """Bridge: delete a notebook's persisted conversation from disk.
+
+    Called when the user removes a session from the switcher, or when the
+    underlying .ipynb file is deleted in the file browser.
+    """
+    from jupyter.conversation_store import delete_conversation
+    delete_conversation(nb_path)
+
+
+def _panel_switch_notebook(nb_path: str) -> None:
+    """Bridge: the active notebook changed — give it its own agent conversation.
+
+    The backend AgentMagic is a kernel-wide singleton with a single LLM session,
+    so switching/opening a notebook must reset the agent's conversation memory,
+    otherwise the new notebook inherits the previous one's history. Note this
+    resets *LLM memory* only; the kernel's Python namespace is shared across all
+    notebooks on the same kernel and cannot be per-notebook isolated.
+    """
+    inst = _get_magic()
+    if inst:
+        inst._handle_notebook_switch(nb_path)
+
+
+def _panel_upload_skill(filename: str, b64: str) -> None:
+    """Bridge: install a skill from a base64-encoded .zip uploaded by the panel.
+
+    The frontend reads the user-chosen .zip via the browser FileReader, sends
+    it as base64 (over the same requestExecute string channel used everywhere
+    else), and we materialise it to a temp file before handing to
+    ``SkillManager.install``. Refreshes the skill list on success.
+    """
+    inst = _get_magic()
+    if inst:
+        inst._handle_panel_upload_skill(filename, b64)
+
+
+def _panel_restart_agent() -> None:
+    """Bridge: restart the agent backend so skill enable/disable takes effect.
+
+    hermes bakes the skill set into a per-session cached system prompt and
+    never rebuilds mid-session, so a toggle only reaches the agent on a fresh
+    session. This tears down the current session/client cleanly.
+    """
+    inst = _get_magic()
+    if inst:
+        inst._handle_panel_restart_agent()
+
+
+def _merge_prompt(claude_md_path: str | None = None, mode: str | None = None) -> str:
+    return PromptBuilder.main(claude_md_path, mode=mode)
 
 
 def _register_hooks(timeout: int, hook_cfg: dict) -> None:
@@ -147,6 +246,7 @@ class AgentState(Enum):
     IDLE = auto()
     STREAMING = auto()           # agent is generating a response
     PLAN_REVIEW = auto()         # plan displayed, waiting for confirm/revision
+    GATE_REVIEW = auto()         # decision gate displayed, waiting for human choice
     WAITING_CONFIRM = auto()     # response ready, waiting for user yes/no before acting
     AUTO_FIXING = auto()         # deferred auto-fix in progress (auto mode)
 
@@ -167,14 +267,19 @@ class AgentMagic(Magics):
         self._busy = False                         # legacy — will be removed after refactor
         self._last_plan_prompt = ""
         self._last_plan_output = ""
+        self._last_user_prompt = ""                    # last raw user prompt, for playbook keying
+        self._playbook = None                          # lazy PlaybookStore (experience loop)
         self._last_plan_result = None                  # cached ParsedResult for _implement_plan
         self._pending_result = None                    # ParsedResult waiting for user confirmation
+        self._pending_gate = None                      # decision_gate dict waiting for human choice
         self._agent_cells: dict[str, str] = {}     # cell_id → code, for auto-fix lookup
         self._round_results: list[dict] = []        # [{cell_id, code, output}] for auto-fix lookup
+        self._steps: list[dict] = []                # ordered step model: [{index,title,code,cell_id,status}]
         self._auto_pending = 0                      # count of auto-exec cells still running
         self._auto_fix_count = 0                    # limit retries per batch
         self._session_ready = False                 # lazy-init session on first query
         self._session_dirty = False                 # set on interrupt, prepend note on next query
+        self._session_nb_path = None                # notebook path the current session is bound to
         self._jupyter_config_path = ""              # path from JUPYTER_CONFIG_PATH env var
         self._config_pending = None                 # pending (resolved, new_path, old_path)
         self._cell_restored = False                 # track if any cell was individually restored
@@ -185,11 +290,93 @@ class AgentMagic(Magics):
         # Load default config for hooks baseline, then auto-load from env var
         cfg = load_yaml_config("conf/jupyter_agent.yaml")
         self._hook_cfg = cfg.get("hooks", {})
+        self._exec_mode = self._resolve_exec_mode(cfg)  # session-level default posture
         self._startup_config_msg = self._load_jupyter_config()
         self.ns.delta()
         shell.events.register("post_run_cell", self._on_cell_run)
         from .panel import init_panel_comm
         init_panel_comm(shell)
+
+    @staticmethod
+    def _resolve_exec_mode(cfg: dict) -> str:
+        """Resolve the session-level execution posture.
+
+        Precedence: SKILLBOT_MODE env var > yaml ``mode`` key > "pipeline".
+        Accepts the exec names (pipeline/exploration) or UI-mode aliases
+        (default/auto/plan). Unknown values fall back to pipeline.
+        """
+        raw = (_os.environ.get("SKILLBOT_MODE") or cfg.get("mode") or "pipeline")
+        raw = str(raw).strip().lower()
+        if raw in ("pipeline", "exploration"):
+            return raw
+        return _UI_MODE_TO_EXEC.get(raw, "pipeline")
+
+    # ---- experience loop (playbook) ------------------------------------------
+
+    def _get_playbook(self):
+        """Lazily open the cross-session playbook store (survives session cleanup)."""
+        if self._playbook is None:
+            from pathlib import Path as _Path
+            from memory import PlaybookStore
+            root = _Path(__file__).resolve().parents[2]
+            self._playbook = PlaybookStore(str(root / ".run" / "playbook.jsonl"))
+        return self._playbook
+
+    def _recall_playbook(self, prompt: str) -> str:
+        """Return a compact few-shot block of past adopted decisions, or ""."""
+        try:
+            hits = self._get_playbook().recall(prompt, top_k=3)
+        except Exception:
+            _log.exception("playbook recall failed")
+            return ""
+        rec = get_recorder()
+        if rec:
+            rec.record("playbook_recall",
+                n_hits=len(hits),
+                top_score=hits[0][1] if hits else 0.0,
+            )
+        if not hits:
+            return ""
+        lines = [
+            "[System: Relevant past decisions the user adopted for similar requests. "
+            "Treat as precedent — reuse the chosen direction unless the current request "
+            "clearly differs.]"
+        ]
+        for entry, _score in hits:
+            piece = f"- Request: {entry.request}"
+            if entry.question:
+                piece += f" | Q: {entry.question}"
+            piece += f" | Chosen: {entry.chosen}"
+            lines.append(piece)
+        return "\n".join(lines) + "\n\n"
+
+    def _record_adopted_decision(self, gate: dict, chosen_label: str, chosen_evidence: str) -> None:
+        """Persist a human-adopted gate choice as a playbook entry (positive sample).
+
+        Uses ``upsert`` (not raw append) so re-deciding a similar request corrects
+        the prior precedent instead of stacking a duplicate/contradictory one.
+        """
+        request = self._last_user_prompt.strip()
+        if not request or not chosen_label:
+            return
+        try:
+            from memory import PlaybookEntry
+            action = self._get_playbook().upsert(PlaybookEntry(
+                request=request,
+                gate_type=gate.get("type", ""),
+                question=gate.get("question", ""),
+                chosen=chosen_label,
+                evidence=chosen_evidence,
+                mode=getattr(self, "_exec_mode", "pipeline"),
+            ))
+            rec = get_recorder()
+            if rec:
+                rec.record("playbook_upsert",
+                    action=action,
+                    gate_type=gate.get("type", ""),
+                )
+        except Exception:
+            _log.exception("playbook add failed")
 
     # ---- state machine helpers -----------------------------------------------
 
@@ -202,6 +389,7 @@ class AgentMagic(Magics):
         self._auto_pending = 0
         self._auto_fix_count = 0
         self._pending_result = None
+        self._pending_gate = None
         self._round_results.clear()
         send_to_panel(self.ns, "text", content=msg)
         send_to_panel(self.ns, "result", summary="")
@@ -276,6 +464,7 @@ class AgentMagic(Magics):
         self._busy = False
         self._auto_pending = 0
         self._pending_result = None
+        self._pending_gate = None
         self._round_results.clear()
         self._agent_cells.clear()
         if msg:
@@ -293,9 +482,170 @@ class AgentMagic(Magics):
             )
 
     def _track_agent_cell(self, cid: str, code_str: str) -> None:
-        """Callback: track agent-generated cell IDs for batch completion detection."""
-        if cid:
-            self._agent_cells[cid] = "pending"
+        """Callback: track agent-generated cell IDs for batch completion detection.
+
+        Also binds the real cell id to its step in the timeline model: each block
+        rendered by ``render_output`` fires this once the frontend replies with the
+        created cell's id, letting us map step ↔ cell and flip it to ``running``.
+        """
+        if not cid:
+            return
+        self._agent_cells[cid] = "pending"
+        # Bind this cell to the first still-unbound step whose code matches, so a
+        # step can be re-run / rolled back / revised individually later on.
+        clean = self._strip_sentinel(code_str)
+        for step in self._steps:
+            if step.get("cell_id"):
+                continue
+            if step.get("code", "").strip() == clean:
+                step["cell_id"] = cid
+                step["status"] = "running"
+                break
+        else:
+            # No code match (e.g. SQL rewrite) — bind by order to the next slot.
+            for step in self._steps:
+                if not step.get("cell_id"):
+                    step["cell_id"] = cid
+                    step["status"] = "running"
+                    break
+        self._push_steps()
+
+    @staticmethod
+    def _strip_sentinel(code_str: str) -> str:
+        """Drop the ``# %%agent generate code`` marker render_code appends."""
+        return code_str.replace("# %%agent generate code", "").strip()
+
+    @staticmethod
+    def _step_title(code: str) -> str:
+        """Derive a short human label for a step from its code."""
+        for line in code.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            # Prefer a leading comment as the intent, else the first real line.
+            if s.startswith("#"):
+                s = s.lstrip("#").strip()
+            if s.startswith("%%sql"):
+                s = "SQL query"
+            return (s[:60] + "…") if len(s) > 60 else s
+        return "step"
+
+    def _build_steps(self, code_list: list[str]) -> None:
+        """Seed the ordered step model for a fresh batch of agent cells."""
+        self._steps = [
+            {
+                "index": i + 1,
+                "title": self._step_title(c),
+                "code": (c or "").strip(),
+                "cell_id": "",
+                "status": "pending",
+            }
+            for i, c in enumerate(code_list)
+        ]
+        self._push_steps()
+
+    def _push_steps(self) -> None:
+        """Send the current step timeline to the panel."""
+        send_to_panel(self.ns, "step_timeline", steps=self._steps)
+
+    def _mark_step(self, cell_id: str, status: str, code: str = "") -> None:
+        """Flip the step bound to ``cell_id`` (refreshing its code) and push."""
+        if not cell_id:
+            return
+        for step in self._steps:
+            if step.get("cell_id") == cell_id:
+                step["status"] = status
+                if code:
+                    step["code"] = self._strip_sentinel(code)
+                    step["title"] = self._step_title(step["code"])
+                self._push_steps()
+                return
+
+
+    def _handle_violations(self, arg: str) -> None:
+        """`/violations` — read back the durable guardrail-violation log.
+
+        Pure backend (like `/steps`): reads `.run/guardrail/<instance>.jsonl`
+        and renders a markdown summary + recent rows to the panel, so the
+        model's misbehaviour rate is directly queryable in the UI.
+
+        Args:
+          (none)          this instance/port only
+          ``all``         merge every instance file → cross-user/port view
+          ``clear``       delete this instance's log
+          ``clear all``   delete every instance's log
+        """
+        from . import guardrail_log
+        arg = (arg or "").strip()
+
+        if arg.startswith("clear"):
+            wipe_all = arg.split()[1:2] == ["all"]
+            try:
+                targets = (guardrail_log._all_paths() if wipe_all
+                           else [guardrail_log._default_path()])
+                removed = 0
+                for p in targets:
+                    if p.is_file():
+                        p.unlink()
+                        removed += 1
+                scope_txt = "all instances" if wipe_all else "this instance"
+                send_to_panel(self.ns, "text",
+                    content=f"✓ Guardrail violation log cleared ({scope_txt}, "
+                            f"{removed} file(s)).\n")
+            except OSError as exc:
+                send_to_panel(self.ns, "text", content=f"✗ Could not clear log: {exc}\n")
+            return
+
+        scope = "all" if arg == "all" else "instance"
+        summary = guardrail_log.summarize(scope=scope)
+        total = summary.get("total", 0)
+        scope_label = "across all instances" if scope == "all" else "this instance"
+        if not total:
+            hint = "" if scope == "all" else " — try `/violations all` for a cross-instance view"
+            send_to_panel(self.ns, "text",
+                content=f"✓ No guardrail violations recorded ({scope_label}) — the agent "
+                        f"has been delivering code as cells.{hint}\n")
+            return
+
+        lines = [f"### 🛡️ Guardrail violations: {total} total ({scope_label})"]
+        by_kind = summary.get("by_kind", {})
+        if by_kind:
+            lines.append("")
+            for kind, n in sorted(by_kind.items(), key=lambda kv: -kv[1]):
+                lines.append(f"- **{kind}**: {n}")
+
+        # Per-instance / per-user breakdown is the whole point of `all`.
+        if scope == "all":
+            by_inst = summary.get("by_instance", {})
+            by_user = summary.get("by_user", {})
+            if by_inst:
+                lines.append("")
+                lines.append("**By instance:** "
+                    + " · ".join(f"`{k}`={n}" for k, n in sorted(by_inst.items(), key=lambda kv: -kv[1])))
+            if by_user:
+                lines.append("**By user:** "
+                    + " · ".join(f"`{k}`={n}" for k, n in sorted(by_user.items(), key=lambda kv: -kv[1])))
+
+        if summary.get("first") and summary.get("last"):
+            lines.append("")
+            lines.append(f"_First: {summary['first']} · Last: {summary['last']}_")
+
+        recent = guardrail_log.read_violations(limit=10, scope=scope)
+        if recent:
+            lines.append("")
+            lines.append("**Most recent (up to 10):**")
+            lines.append("")
+            lines.append("| time | instance | user | kind | path |")
+            lines.append("|------|----------|------|------|------|")
+            for r in reversed(recent):
+                ts = str(r.get("timestamp", ""))[:19]
+                lines.append(
+                    f"| {ts} | {r.get('instance', '')} | {r.get('user', '')} "
+                    f"| {r.get('kind', '')} | `{r.get('path', '')}` |"
+                )
+        lines.append("")
+        lines.append("_`/violations all` for every instance · `/violations clear [all]` to reset._")
+        send_to_panel(self.ns, "text", content="\n".join(lines) + "\n")
 
     def _ask_confirm(self, msg: str, pending_result=None) -> None:
         """Show Yes/No confirmation — text + buttons via comm."""
@@ -309,12 +659,293 @@ class AgentMagic(Magics):
             content=f"\n{'─'*40}\n{msg}\nType /continue yes or /continue no\n{'─'*40}\n")
         send_to_panel(self.ns, "continue_confirm", summary=msg)
 
-    def _handle_continue(self, arg: str) -> None:
-        """Handle /continue yes|no from panel."""
-        arg = arg.strip()
+    # Prose patterns that signal the model is asking the human to pick between
+    # alternatives (rather than continue). Conservative — must co-occur with a
+    # question mark so plain statements never trip it.
+    _CHOICE_PATTERNS = (
+        # "X 还是 Y" — the classic Chinese "or" between named alternatives; with
+        # the required '?' this is almost always a pick, not rhetorical.
+        re.compile(r"还是"),
+        re.compile(r"你(?:想)?选|请选择|二选一|选择|选哪|挑(?:一)?个|哪(?:一)?个|哪种|"
+                   r"which\s+(?:option|approach|one|way|of)", re.I),
+        re.compile(r"(?:方案|方向|口径|选项|approach|option)\s*[一二三四1-4A-D]"),
+        re.compile(r"要不要|是否需要|需不需要"),
+        re.compile(r"\b[A-D]\s*(?:or|/|、)\s*[A-D]\b", re.I),
+    )
+
+    def _looks_like_choice(self, text: str) -> bool:
+        """True when the text reads like a human-facing A/B choice question."""
+        if not text or ("?" not in text and "？" not in text):
+            return False
+        return any(p.search(text) for p in self._CHOICE_PATTERNS)
+
+    def _rescue_gate_from_text(self, text: str) -> dict | None:
+        """One-shot re-prompt: ask the model to re-express a prose choice as a
+        structured decision_gate so the human gets the real option cards.
+
+        Fully guarded — any failure (provider down, interrupted, no gate parsed)
+        returns None so the caller falls back to echoing the question. Runs
+        through _stream_with_interrupt, so Stop still works during the rescue.
+        """
+        try:
+            directive = (
+                "[System: Your previous reply asked the human to choose between options in "
+                "prose. Re-express ONLY that choice as a structured decision_gate JSON: 2-4 "
+                "options, each with concrete evidence, at most one recommended=true, and a "
+                "one-line question. Output just the ```json block with a \"decision_gate\" "
+                "field — no other text, no code.]\n\nPrevious reply:\n" + text[:2000]
+            )
+            raw, interrupted = self._stream_with_interrupt(directive)
+            if interrupted or not raw.strip():
+                return None
+            return parse(raw).decision_gate
+        except Exception:
+            _log.exception("gate rescue failed")
+            return None
+
+    def _resolve_no_code(self, result) -> None:
+        """Fallback when the agent returned neither code nor a structured gate.
+
+        Old behavior blindly showed a blank "Continue?" Yes/No even when the
+        model was actually asking the human to pick between options — so the
+        buttons looked meaningless and hid where each answer led. Now:
+          1. if the prose reads like an A/B choice, try once to convert it into
+             a real decision_gate (surfacing the option+evidence cards);
+          2. failing that, echo the model's actual question as the confirm
+             prompt so Yes/No is at least intelligible;
+          3. otherwise fall back to the generic "Continue?".
+        """
+        text = (getattr(result, "text", "") or "").strip()
+        has_question = ("?" in text) or ("？" in text)
+
+        if self._looks_like_choice(text):
+            gate = self._rescue_gate_from_text(text)
+            if gate:
+                self._show_gate(gate)
+                return
+
+        if has_question and text:
+            self._ask_confirm(text, pending_result=result)
+        else:
+            self._ask_confirm("Continue?", pending_result=result)
+
+    # Prose that signals the model needs the human to TYPE an input (a path, a
+    # column, a value) before its code can run. Conservative — must co-occur
+    # with a question mark so plain statements never trip it.
+    _INPUT_REQUEST_PATTERNS = (
+        re.compile(r"路径|地址|目录|文件在(?:哪|什么)|在(?:哪里|什么地方)|哪个文件|哪些文件"),
+        re.compile(r"叫什么|什么名字|列名|字段名|表名"),
+        re.compile(r"告诉我|发(?:我|给我)|提供|贴(?:一下|上)"),
+        re.compile(r"what(?:'s| is) the (?:path|file|column|name|value)|"
+                   r"which file|where (?:is|are)|provide the", re.I),
+    )
+
+    def _asks_for_input(self, text: str) -> bool:
+        """True when the model is asking the human to TYPE something needed to
+        run the code (a path, column, value) — so a Yes/No execute prompt makes
+        no sense yet."""
+        if not text or ("?" not in text and "？" not in text):
+            return False
+        return any(p.search(text) for p in self._INPUT_REQUEST_PATTERNS)
+
+    def _confirm_code_or_ask(self, result) -> None:
+        """Default-mode landing when the agent returned runnable code.
+
+        Guards the mismatch the user hit: the model both generated cells AND
+        asked for an input those cells depend on (e.g. a file path). Executing
+        them would just fail, so instead of a nonsensical "Generate and execute
+        N cells?" Yes/No, we surface the question and return control to the
+        input box — the human types the answer and the code is regenerated next
+        turn. When the code is actually runnable, the normal confirm shows.
+        """
+        text = (getattr(result, "text", "") or "").strip()
+        if self._asks_for_input(text):
+            self._record_state("await_user_input")
+            self._finish_agent_run()
+            return
+        self._ask_confirm(f"Generate and execute {len(result.code_list)} cells?",
+                          pending_result=result)
+
+    def _show_gate(self, gate: dict) -> None:
+        """Pause at a decision gate — show the human structured options + evidence.
+
+        Before showing, fold in any matching past decision (KnowSelf-style: recall
+        before re-asking). A prior adopted choice for a similar request pre-selects
+        the same option + adds a precedent hint — the full gate still shows, so a
+        genuine new divergence is never silently auto-answered.
+        """
+        hit = False
+        try:
+            request = (self._last_user_prompt or "").strip()
+            if request:
+                hit = self._get_playbook().annotate_gate(gate, request)
+        except Exception:
+            _log.exception("playbook gate annotation failed")
+        self._state = AgentState.GATE_REVIEW
+        self._record_state("gate_shown")
+        self._busy = False
+        self._pending_gate = gate
         rec = get_recorder()
         if rec:
-            rec.record("agent_continue", choice="yes" if arg.strip() == "yes" else "no")
+            rec.record("playbook_gate_annotated",
+                hit=hit,
+                gate_type=gate.get("type", ""),
+            )
+            rec.record("decision_gate_shown",
+                gate_type=gate.get("type", ""),
+                question=gate.get("question", ""),
+                option_count=len(gate.get("options", [])),
+            )
+        send_to_panel(self.ns, "result", summary="")
+        send_to_panel(self.ns, "decision_gate", gate=gate)
+        send_to_panel(self.ns, "ready")
+
+    def _handle_gate_test(self) -> None:
+        """DEBUG: push a sample decision_gate through the real comm channel.
+
+        Lets you see the real panel component + round-trip (↑↓/Tab/Enter/click)
+        without depending on the model to emit a gate this turn. Choosing an
+        option routes through the normal ``/gate <idx>`` handler.
+        """
+        gate = {
+            "type": "direction",
+            "question": '按哪个口径定义"逾期"来做增益评估？',
+            "options": [
+                {
+                    "label": "DPD30+（逾期满 30 天）",
+                    "recommended": True,
+                    "evidence": "行业主流口径；hive 表 bnpl_loan_status 已有 dpd 字段，"
+                                "覆盖 SG 全量，样本 ~1200 万行，查询成本低（~40s）。",
+                },
+                {
+                    "label": "DPD1+（首逾）",
+                    "evidence": "更敏感但噪声大；需 join 还款流水表 bnpl_repay_flow，"
+                                "多一次 shuffle，成本约 3x。",
+                },
+                {
+                    "label": "自定义账龄窗口",
+                    "evidence": "需你补充窗口定义（如 7/14/60 天），当前无现成字段，要额外建临时表。",
+                },
+            ],
+        }
+        self._show_gate(gate)
+
+    def _handle_gate(self, arg: str) -> None:
+        """Handle /gate <index> from panel — feed the human's choice back to the agent."""
+        gate = self._pending_gate
+        self._pending_gate = None
+        if gate is None:
+            send_to_panel(self.ns, "text", content="No active decision.\n")
+            return
+        options = gate.get("options", [])
+        arg = arg.strip()
+        rec = get_recorder()
+        if arg == "cancel" or not arg:
+            if rec:
+                rec.record("decision_gate_choice", choice="cancel", gate_type=gate.get("type", ""))
+            self._finish_agent_run("Decision cancelled")
+            self._record_state("gate_cancel")
+            return
+        try:
+            idx = int(arg)
+        except ValueError:
+            idx = -1
+        if not (0 <= idx < len(options)):
+            # Free-text answer: treat as the human's decision verbatim.
+            chosen_label = arg
+            chosen_evidence = ""
+        else:
+            chosen_label = options[idx].get("label", "")
+            chosen_evidence = options[idx].get("evidence", "")
+        if rec:
+            rec.record("decision_gate_choice",
+                choice=chosen_label, gate_type=gate.get("type", ""), index=idx,
+            )
+        # Experience loop: a human-adopted gate choice is a positive sample —
+        # persist it as a playbook entry keyed by the request that triggered it.
+        self._record_adopted_decision(gate, chosen_label, chosen_evidence)
+        send_to_panel(self.ns, "text", content=f"→ decision: {chosen_label}\n")
+        self._state = AgentState.STREAMING
+        self._record_state("gate_choice")
+        self._busy = True
+        prompt = (
+            f"[System: The human answered the '{gate.get('type', '')}' decision gate.\n"
+            f"Question: {gate.get('question', '')}\n"
+            f"Chosen: {chosen_label}"
+            + (f"\nContext: {chosen_evidence}" if chosen_evidence else "")
+            + "]\n\nContinue the task based on this decision."
+        )
+        raw, interrupted = self._stream_with_interrupt(prompt)
+        if interrupted:
+            return
+        if not raw.strip():
+            self._finish_agent_run()
+            return
+        result = parse(raw)
+        if result.decision_gate:
+            self._show_gate(result.decision_gate)
+        elif result.code_list:
+            self._confirm_code_or_ask(result)
+        else:
+            self._resolve_no_code(result)
+
+    def _reply_to_agent(self, text: str, kind: str = "continue") -> None:
+        """Feed a free-text human reply back into the live session.
+
+        Powers the "type your answer" box on the confirm/gate overlays: instead
+        of a bare Yes/No, the human can answer the agent's question (a file path,
+        a clarification) in prose. We drop any pending code (it was blocked on
+        this very answer), echo the reply, and stream the continuation in the
+        SAME session so the agent still remembers what it asked.
+        """
+        text = text.strip()
+        if not text:
+            send_to_panel(self.ns, "ready")
+            return
+        self._pending_result = None
+        self._pending_gate = None
+        send_to_panel(self.ns, "text", content=f"↳ {text}\n")
+        self._state = AgentState.STREAMING
+        self._record_state(f"{kind}_reply")
+        self._busy = True
+        rec = get_recorder()
+        if rec:
+            rec.record("agent_prompt", mode=f"{kind}_reply", prompt="", context_preview="")
+        prompt = (
+            "[System: The human replied to your previous question in prose "
+            "(they typed an answer rather than picking an option). Their reply "
+            "follows — continue the task using it.]\n\n" + text
+        )
+        raw, interrupted = self._stream_with_interrupt(prompt)
+        if interrupted:
+            return
+        if not raw.strip():
+            self._finish_agent_run()
+            return
+        result = parse(raw)
+        if result.decision_gate:
+            self._show_gate(result.decision_gate)
+        elif result.code_list:
+            self._confirm_code_or_ask(result)
+        else:
+            self._resolve_no_code(result)
+
+    def _handle_continue(self, arg: str) -> None:
+        """Handle /continue yes|no|<free text> from panel.
+
+        yes  -> run the pending cells; no -> stop. Anything else is the human
+        TYPING an answer instead of picking Yes/No (e.g. supplying a file path
+        the agent asked for): we drop the pending code and feed the reply back
+        into the live session so the agent continues with that answer in
+        context.
+        """
+        arg = arg.strip()
+        rec = get_recorder()
+        if arg and arg not in ("yes", "no"):
+            self._reply_to_agent(arg, kind="continue")
+            return
+        if rec:
+            rec.record("agent_continue", choice="yes" if arg == "yes" else "no")
         if arg != "yes":
             self._finish_agent_run("Task stopped")
             self._record_state("user_stop")
@@ -330,6 +961,7 @@ class AgentMagic(Magics):
             self._agent_cells.clear()
             self._auto_fix_count = 0
             self._auto_pending = len(pending.code_list)
+            self._build_steps(pending.code_list)
             render_output(self.ns, pending, auto=True, on_cell_id=self._track_agent_cell)
             if self._auto_pending == 0:
                 self._finish_agent_run()
@@ -350,10 +982,12 @@ class AgentMagic(Magics):
             self._finish_agent_run()
             return
         result = parse(raw)
-        if result.code_list:
-            self._ask_confirm(f"Generate and execute {len(result.code_list)} cells?", pending_result=result)
+        if result.decision_gate:
+            self._show_gate(result.decision_gate)
+        elif result.code_list:
+            self._confirm_code_or_ask(result)
         else:
-            self._ask_confirm("Continue?", pending_result=result)
+            self._resolve_no_code(result)
 
     def _handle_panel_stop(self) -> None:
         """Handle /stop — exit current task immediately."""
@@ -459,8 +1093,9 @@ class AgentMagic(Magics):
     def _init_session(self, agent: str, timeout: int, claude_md: str | None = None) -> None:
         self._session = AgentSession(agent, timeout)
         self._session.configure_subs(SUB_AGENT_DEFAULTS)
+        self._session_prompt_mode = getattr(self, "_exec_mode", "pipeline")
         self._session.init_session(
-            system_prompt=_merge_prompt(claude_md),
+            system_prompt=_merge_prompt(claude_md, mode=self._session_prompt_mode),
             session_key=_session_key(),
             on_init=lambda s: _register_hooks(timeout, self._hook_cfg),
         )
@@ -495,6 +1130,10 @@ class AgentMagic(Magics):
             self._round_results.append({
                 "cell_id": cell_id, "code": code.strip(), "output": output.strip()
             })
+
+            # Flip the matching step to done/failed so the timeline reflects reality
+            # (covers both the initial batch and any single-step re-run from the panel).
+            self._mark_step(cell_id, "failed" if not result.success else "done", code=code.strip())
 
             # Auto mode: decrement pending count
             if self._auto_pending > 0:
@@ -553,7 +1192,7 @@ class AgentMagic(Magics):
         if text.startswith("/confirm "):
             self._handle_panel_confirm(text[9:])
         elif text == "/clear":
-            send_to_panel(self.ns, "clear")
+            self._handle_panel_clear()
         elif text.startswith("/mode "):
             self._handle_panel_mode(text[6:].strip())
         elif text.startswith("/skills"):
@@ -569,10 +1208,18 @@ class AgentMagic(Magics):
                 send_to_panel(self.ns, "text", content="✗ No cells to snapshot.\n")
         elif text.startswith("/continue"):
             self._handle_continue(text[10:].strip())
+        elif text.startswith("/gatetest"):
+            self._handle_gate_test()
+        elif text.startswith("/gate"):
+            self._handle_gate(text[5:].strip())
         elif text == "/stop":
             self._handle_panel_stop()
         elif text.startswith("/cell-optimize"):
             self._handle_cell_optimize(text)
+        elif text == "/steps":
+            self._push_steps()
+        elif text.startswith("/violations"):
+            self._handle_violations(text[len("/violations"):].strip())
         elif text.startswith("/cell-snapshot-restore"):
             self._handle_cell_restore(text)
         else:
@@ -598,17 +1245,32 @@ class AgentMagic(Magics):
             return
 
         # Build prompt with context
+        self._last_user_prompt = prompt
         ctx = self.ns.delta()
         full = f"{ctx}\n\n{prompt}" if ctx else prompt
 
+        # Experience loop: recall past adopted decisions for similar requests and
+        # inject them as a few-shot precedent block.
+        recall = self._recall_playbook(prompt)
+        if recall:
+            full = recall + full
+
+        # Resolve this turn's execution posture. plan→exploration, auto→pipeline,
+        # default→the session's current posture. If it differs from the posture that
+        # was baked into the system prompt, inject a directive so a mid-session switch
+        # takes effect without rebuilding the session.
+        if mode == "plan":
+            turn_mode = "exploration"
+        elif mode == "auto":
+            turn_mode = "pipeline"
+        else:
+            turn_mode = getattr(self, "_exec_mode", "pipeline")
+        baked_mode = getattr(self, "_session_prompt_mode", "pipeline")
+        if turn_mode != baked_mode:
+            full = _EXEC_MODE_DIRECTIVE.get(turn_mode, "") + full
+
         if mode == "plan":
             self._last_plan_prompt = prompt
-            plan_prefix = (
-                "[System: You are in plan mode. Explore the request, research the codebase, "
-                "and design an implementation approach. Present your plan as structured markdown. "
-                "Do NOT write or execute any code until the user confirms the plan.]\n\n"
-            )
-            full = plan_prefix + full
 
         # Stream
         self._state = AgentState.STREAMING
@@ -629,10 +1291,25 @@ class AgentMagic(Magics):
 
         # Process result
         result = parse(raw)
+        # Decision gate takes precedence: the agent is handing a judgement back to
+        # the human, so pause and show options regardless of mode.
+        if result.decision_gate:
+            self._show_gate(result.decision_gate)
+            return
         if mode == "plan":
             self._last_plan_output = raw.strip()
             self._last_plan_result = result  # cache parsed result to avoid re-parse in _implement_plan
             plan_text = result.plan or result.text or ""
+            # Plan mode still owes the human a decision when the "plan" is really
+            # a prose A/B/C choice (model listed 选项B/C/D instead of emitting a
+            # structured decision_gate). Rescue it into option cards — otherwise
+            # the old three-way "Approve this plan?" overlay hides where each
+            # branch leads. Falls back to the plan confirm on any rescue miss.
+            if self._looks_like_choice(plan_text):
+                gate = self._rescue_gate_from_text(plan_text)
+                if gate:
+                    self._show_gate(gate)
+                    return
             send_to_panel(self.ns, "plan_confirm", summary=plan_text)
             self._state = AgentState.PLAN_REVIEW
             self._busy = False
@@ -645,16 +1322,175 @@ class AgentMagic(Magics):
             if self._auto_pending == 0:
                 self._finish_agent_run()
             else:
+                self._build_steps(result.code_list)
                 render_output(self.ns, result, auto=True, on_cell_id=self._track_agent_cell)
                 # _on_cell_run handles completion: sends ready when _auto_pending == 0
         else:
             if result.code_list:
-                self._ask_confirm(f"Generate and execute {len(result.code_list)} cells?", pending_result=result)
+                self._confirm_code_or_ask(result)
             else:
-                self._ask_confirm("Continue?", pending_result=result)
+                self._resolve_no_code(result)
 
     def _handle_panel_mode(self, mode: str) -> None:
-        """Handle /mode from panel — mode is tracked by frontend, nothing to persist."""
+        """Handle /mode from panel — update the session's execution posture.
+
+        The frontend still tracks the UI mode (default/plan/auto) for interaction
+        rhythm; here we map it to the exec posture so subsequent default-mode turns
+        (and any freshly-built session) adopt it.
+        """
+        exec_mode = _UI_MODE_TO_EXEC.get(mode.strip().lower())
+        if exec_mode:
+            self._exec_mode = exec_mode
+
+    def _skill_mgr(self):
+        """Return the live SkillManager, or a fresh one for the configured agent.
+
+        Used by upload/skills handlers so the manager always points at the same
+        directory the agent loads from, whether or not a session exists yet.
+        """
+        session = getattr(self, '_session', None)
+        if session and session.client:
+            return session.client.skills
+        try:
+            from chat.skill import SkillManager
+            from chat import _resolve_skill_dir
+            return SkillManager(_resolve_skill_dir(self._agent))
+        except Exception as e:
+            _log.warning("_skill_mgr: fallback SkillManager failed: %s", e)
+            return None
+
+    def _refresh_skill_list(self, mgr) -> None:
+        """Re-scan and push the current skill list to the panel."""
+        from .panel import send_skill_list
+        send_skill_list([
+            {"name": s.name, "description": s.description, "enabled": s.enabled,
+             "category": s.category, "body": s.body[:1000]}
+            for s in mgr.list_skills()
+        ])
+
+    def _handle_panel_upload_skill(self, filename: str, b64: str) -> None:
+        """Install an uploaded (base64) .zip skill, then refresh the list."""
+        import base64
+        import tempfile
+        import os
+        from .panel import send_to_panel
+        mgr = self._skill_mgr()
+        if not mgr:
+            send_to_panel(self.ns, "text", content="✗ session not initialized\n")
+            return
+        name = os.path.basename(filename or "skill.zip")
+        if not name.lower().endswith(".zip"):
+            send_to_panel(self.ns, "text", content=f"✗ expected a .zip file, got: {name}\n")
+            return
+        tmp_path = None
+        try:
+            raw = base64.b64decode(b64)
+            fd, tmp_path = tempfile.mkstemp(prefix="skillbot-upload-", suffix=".zip")
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(raw)
+            info = mgr.install(tmp_path)
+            send_to_panel(self.ns, "text", content=f"✓ {info.name} uploaded (enabled)\n")
+            self._refresh_skill_list(mgr)
+        except Exception as e:
+            send_to_panel(self.ns, "text", content=f"✗ upload failed: {e}\n")
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    def _reset_session_state(self) -> None:
+        """Tear down the LLM session and wipe all per-conversation state.
+
+        Shared by /clear and notebook switching. Drops the agent session (so the
+        next prompt rebuilds a fresh one with a new session_id → empty LLM
+        context) and resets the step model, round results, cell map, and any
+        pending confirm/gate/plan state. Does NOT touch the kernel's Python
+        namespace — variables persist (kernel-wide, can't be per-notebook).
+        """
+        old = getattr(self, '_session', None)
+        if old is not None:
+            try:
+                old.cleanup()
+            except Exception as e:
+                _log.warning("session cleanup failed: %s", e)
+        self._session = None
+        self._session_ready = False
+        self._session_dirty = False
+        self._state = AgentState.IDLE
+        self._busy = False
+        self._steps = []
+        self._round_results = []
+        self._agent_cells = {}
+        self._auto_pending = 0
+        self._auto_fix_count = 0
+        self._last_plan_prompt = ""
+        self._last_plan_output = ""
+        self._last_plan_result = None
+        self._last_user_prompt = ""
+        self._pending_result = None
+        self._pending_gate = None
+
+    def _handle_panel_clear(self) -> None:
+        """Handle /clear — wipe the visible panel AND the agent's memory.
+
+        Previously /clear only blanked the frontend display; the LLM session kept
+        its full history, so the agent still 'remembered' everything. Now it truly
+        starts a new conversation (fresh session on the next prompt).
+        """
+        from .panel import send_to_panel
+        self._reset_session_state()
+        send_to_panel(self.ns, "clear")
+        self._push_steps()  # push the now-empty step timeline
+        send_to_panel(self.ns, "ready")
+
+    def _handle_notebook_switch(self, nb_path: str) -> None:
+        """Active notebook changed — start a fresh agent conversation for it.
+
+        Resets LLM memory + step model so the new notebook doesn't inherit the
+        previous one's history. Kernel variables are shared and stay put.
+
+        Guards against spurious ``currentChanged`` events (tab focus, layout
+        restore) by only resetting when the notebook path actually differs from
+        the one the current session is bound to, and never mid-task.
+        """
+        from .panel import send_to_panel
+        prev = getattr(self, "_session_nb_path", None)
+        if prev == nb_path:
+            return  # same notebook — nothing to do
+        self._session_nb_path = nb_path
+        # First bind, or session never started → nothing to reset yet.
+        if prev is None or (not self._session_ready and self._session is None):
+            self._steps = []
+            self._push_steps()
+            return
+        # Don't yank the rug out from under a running task.
+        if self._state != AgentState.IDLE:
+            _log.info("notebook switch ignored — agent busy (state=%s)", self._state)
+            self._session_nb_path = prev  # keep binding until the task finishes
+            return
+        _log.info("notebook switch → resetting agent conversation (path=%s)", nb_path)
+        self._reset_session_state()
+        self._push_steps()
+        send_to_panel(
+            self.ns, "text",
+            content="⟳ new notebook — fresh agent conversation "
+                    "(kernel variables are shared across notebooks)\n",
+        )
+
+    def _handle_panel_restart_agent(self) -> None:
+        """Tear down the current session so the next prompt rebuilds it fresh.
+
+        A fresh session re-reads config.yaml (skill enable/disable) and starts a
+        new hermes session with no previously-injected skill bodies — the only
+        way a toggle deterministically reaches the running agent.
+        """
+        from .panel import send_to_panel
+        self._reset_session_state()
+        send_to_panel(self.ns, "text",
+                      content="⟳ agent restarted — skill changes apply on your next message\n")
+        send_to_panel(self.ns, "ready")
 
     def _handle_panel_skills(self, text: str) -> None:
         """Handle /skills commands from panel."""
@@ -668,11 +1504,13 @@ class AgentMagic(Magics):
         if session and session.client:
             mgr = session.client.skills
         else:
-            # Session not yet initialized — use SkillManager directly
+            # Session not yet initialized (e.g. user opens Skills before sending a
+            # prompt) — build a SkillManager for the *configured* agent, not a
+            # hard-coded default, so the list matches what the agent will load.
             try:
                 from chat.skill import SkillManager
                 from chat import _resolve_skill_dir
-                mgr = SkillManager(_resolve_skill_dir("claude-code"))
+                mgr = SkillManager(_resolve_skill_dir(self._agent))
             except Exception as e:
                 _log.warning("_handle_panel_skills: fallback SkillManager failed: %s", e)
 
@@ -686,7 +1524,8 @@ class AgentMagic(Magics):
                 send_skill_list([])  # show empty state in panel
                 return
             send_skill_list([
-                {"name": s.name, "description": s.description, "enabled": s.enabled, "body": s.body[:1000]}
+                {"name": s.name, "description": s.description, "enabled": s.enabled,
+                 "category": s.category, "body": s.body[:1000]}
                 for s in skills
             ])
 
@@ -759,12 +1598,7 @@ class AgentMagic(Magics):
                 else:
                     mgr.enable(name)
                 # Send updated skill list (text toggle confirmation is redundant with list UI)
-                from .panel import send_skill_list
-                updated = mgr.list_skills()
-                send_skill_list([
-                    {"name": si.name, "description": si.description, "enabled": si.enabled, "body": si.body[:1000]}
-                    for si in updated
-                ])
+                self._refresh_skill_list(mgr)
             except FileNotFoundError:
                 send_to_panel(self.ns, "text", content=f"✗ skill not found: {name}\n")
 
@@ -786,12 +1620,7 @@ class AgentMagic(Magics):
                 send_to_panel(self.ns, "text",
                               content=f"✓ {info.name} installed (enabled)\n")
                 # Refresh skill list
-                from .panel import send_skill_list
-                updated = mgr.list_skills()
-                send_skill_list([
-                    {"name": s.name, "description": s.description, "enabled": s.enabled, "body": s.body[:1000]}
-                    for s in updated
-                ])
+                self._refresh_skill_list(mgr)
             except FileNotFoundError:
                 send_to_panel(self.ns, "text", content=f"✗ file not found: {path}\n")
             except ValueError as e:
@@ -809,12 +1638,7 @@ class AgentMagic(Magics):
                 mgr.uninstall(name)
                 send_to_panel(self.ns, "text", content=f"✓ {name} uninstalled\n")
                 # Refresh skill list
-                from .panel import send_skill_list
-                updated = mgr.list_skills()
-                send_skill_list([
-                    {"name": s.name, "description": s.description, "enabled": s.enabled, "body": s.body[:1000]}
-                    for s in updated
-                ])
+                self._refresh_skill_list(mgr)
             except FileNotFoundError:
                 send_to_panel(self.ns, "text", content=f"✗ skill not found: {name}\n")
 
@@ -946,7 +1770,10 @@ class AgentMagic(Magics):
             return
         cell_id = parts[1]
         version = parts[2]
-        code = restore(cell_id, version)
+        # NOTE: snapshots are bucketed by notebook path (see save/list_versions),
+        # so restore MUST pass the same nb_path or it looks in the wrong bucket
+        # and reports "version vNNNN not found".
+        code = restore(cell_id, version, nb_path=_notebook_path())
         if code is None:
             send_to_panel(self.ns, "text", content=f"Version {version} not found.\n")
             return
@@ -975,29 +1802,69 @@ class AgentMagic(Magics):
         error_msg = (payload.get("error") or "").strip()
         request = (payload.get("request") or "improve this code").strip()
         auto_exec = payload.get("auto", False)
+        revise = payload.get("revise", False)
+        run_below = payload.get("run_below", False)
+        cells_manifest = payload.get("cells") or []
+        selection = payload.get("selection")
         if not code:
             send_to_panel(self.ns, "text", content="✗ cell is empty\n")
             return
 
-        # Truncate large cells to avoid blowing up the context window
-        code_for_prompt = code[:5000]
-        output_for_prompt = output[:2000]
-        if len(code) > 5000:
-            code_for_prompt += f"\n# ... ({len(code) - 5000} more chars)"
+        has_selection = selection and isinstance(selection, dict) and selection.get("start") is not None
+        sel_start = selection["start"] if has_selection else 0
+        sel_end = selection["end"] if has_selection else 0
+        sel_text = (selection.get("text") or "").strip()
 
         is_sql = code.startswith("%%sql")
         lang = "SQL" if is_sql else "Python"
-        prompt = (
-            f"## Current {lang} Cell\n```{lang.lower()}\n{code_for_prompt}\n```\n\n"
-            f"## Output\n```\n{output_for_prompt or '(none)'}\n```"
-        )
-        if error_msg:
-            prompt += f"\n## Error\n```\n{error_msg[:2000]}\n```\n"
-        prompt += (
-            f"\n## Request\n{request}\n\n"
-            f"Return ONLY the improved {lang} code in a fenced code block. "
-            f"Do NOT add explanations."
-        )
+
+        if has_selection and sel_text:
+            code_before = code[:sel_start]
+            code_after = code[sel_end:]
+            code_for_prompt = f"{code_before[:2000]}{'...' if len(code_before) > 2000 else ''}\n" \
+                             f"# === SELECTED CODE ===\n{sel_text[:3000]}\n" \
+                             f"# === END SELECTED ===\n" \
+                             f"{code_after[:2000]}{'...' if len(code_after) > 2000 else ''}"
+            prompt = (
+                f"## Current {lang} Cell\n"
+                f"```\n{code_for_prompt}\n```\n\n"
+                f"## The selected code (between === markers) needs to be modified.\n"
+                f"The code BEFORE and AFTER the selection must be preserved exactly.\n"
+                f"## Output\n```\n{output[:2000] or '(none)'}\n```\n"
+            )
+            if error_msg:
+                prompt += f"\n## Error\n```\n{error_msg[:2000]}\n```\n"
+            prompt += (
+                f"\n## Request\n{request}\n\n"
+                f"Return ONLY the NEW code to REPLACE the selected portion. "
+                f"Do NOT include the code before/after the selection. "
+                f"Do NOT add explanations. "
+                f"Return ONLY the {lang} code in a fenced code block."
+            )
+        else:
+            code_for_prompt = code[:5000]
+            if len(code) > 5000:
+                code_for_prompt += f"\n# ... ({len(code) - 5000} more chars)"
+            prompt = (
+                f"## Current {lang} Cell\n```{lang.lower()}\n{code_for_prompt}\n```\n\n"
+                f"## Output\n```\n{output[:2000] or '(none)'}\n```"
+            )
+            if error_msg:
+                prompt += f"\n## Error\n```\n{error_msg[:2000]}\n```\n"
+            if revise:
+                prompt += (
+                    f"\n## Revised approach for this step\n{request}\n\n"
+                    f"Rewrite THIS step's {lang} to follow the revised approach above. "
+                    f"Keep the same output variable name(s) so the downstream steps "
+                    f"still work. Return ONLY the rewritten {lang} in one fenced code "
+                    f"block. Do NOT add explanations."
+                )
+            else:
+                prompt += (
+                    f"\n## Request\n{request}\n\n"
+                    f"Return ONLY the improved {lang} code in a fenced code block. "
+                    f"Do NOT add explanations."
+                )
 
         try:
             self._ensure_session()
@@ -1009,7 +1876,11 @@ class AgentMagic(Magics):
             send_to_panel(self.ns, "text", content="✗ session init failed\n")
             return
 
-        send_to_panel(self.ns, "text", content=f"↻ optimizing {lang} cell...\n")
+        verb = "revising" if revise else "optimizing"
+        if has_selection:
+            send_to_panel(self.ns, "text", content=f"↻ {verb} selected {lang}...\n")
+        else:
+            send_to_panel(self.ns, "text", content=f"↻ {verb} {lang} cell...\n")
         self._state = AgentState.STREAMING
         self._busy = True
         raw, interrupted = self._stream_with_interrupt(prompt)
@@ -1021,16 +1892,39 @@ class AgentMagic(Magics):
 
         result = parse(raw)
         if result.code_list:
-            # Take the last code block (agent might preface with explanation)
             optimized = result.code_list[-1]
+
+            if has_selection:
+                new_code = code_before + optimized + code_after
+                optimized = new_code
+
             from .render import render_code
-            render_code(self.ns, optimized, auto=auto_exec, replace_cell_id=cell_id)
+            run_ids: list = []
+            if run_below and cells_manifest:
+                from .depgraph import dependent_cells
+                manifest = [
+                    {"id": c.get("id"), "exec": c.get("exec"),
+                     "code": optimized if c.get("id") == cell_id else (c.get("code") or "")}
+                    for c in cells_manifest
+                ]
+                run_ids = dependent_cells(manifest, cell_id)
+            render_code(self.ns, optimized, auto=auto_exec, replace_cell_id=cell_id,
+                        run_below=run_below and not run_ids, run_cell_ids=run_ids)
             self.ns.remove_cell_by_id(cell_id)
             self.ns.track_context(
-                f"[cell {cell_id[:8]}] optimized ({lang}): {request}\n"
+                f"[cell {cell_id[:8]}] {'revised' if revise else 'optimized'} ({lang}): {request}\n"
                 f"  old: {code[:100]}{'...' if len(code) > 100 else ''}\n"
                 f"  new: {optimized[:100]}{'...' if len(optimized) > 100 else ''}")
-            action = "optimized & run" if auto_exec else "optimized"
+            if revise:
+                if run_ids:
+                    n = len(run_ids)
+                    action = f"revised & re-ran {n} dependent cell{'s' if n != 1 else ''}"
+                elif run_below:
+                    action = "revised & re-ran downstream"
+                else:
+                    action = "revised"
+            else:
+                action = "optimized & run" if auto_exec else "optimized"
             send_to_panel(self.ns, "text", content=f"✓ {lang} cell {action}\n")
         else:
             send_to_panel(self.ns, "text", content="✗ no code in agent response\n")
@@ -1173,12 +2067,13 @@ class AgentMagic(Magics):
                 self._state = AgentState.STREAMING
                 self._busy = True
                 self._auto_pending = len(result.code_list)
+                self._build_steps(result.code_list)
                 render_output(self.ns, result, auto=True, on_cell_id=self._track_agent_cell)
                 if self._auto_pending == 0:
                     self._finish_agent_run()
                     return
             else:
-                self._ask_confirm(f"Generate and execute {len(result.code_list)} cells?", pending_result=result)
+                self._confirm_code_or_ask(result)
             label = "✓ plan implemented\n" if auto else "✓ plan accepted (code cells generated)\n"
             send_to_panel(self.ns, "text", content=label)
             return
@@ -1215,9 +2110,9 @@ class AgentMagic(Magics):
             if self._auto_pending == 0:
                 self._finish_agent_run()
         elif result.code_list:
-            self._ask_confirm(f"Generate and execute {len(result.code_list)} cells?", pending_result=result)
+            self._confirm_code_or_ask(result)
         else:
-            self._ask_confirm("Continue?", pending_result=result)
+            self._resolve_no_code(result)
         send_to_panel(self.ns, "text", content="✓ plan implemented\n" if auto else "✓ plan accepted (code cells generated)\n")
 
     # ---- agent_config ----

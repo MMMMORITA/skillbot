@@ -239,6 +239,201 @@ class TestInjectPrompt:
         prompt = mgr.inject_prompt()
         assert "empty-body" not in prompt  # no body → skipped
 
+
+class TestProgressiveInject:
+    def test_routing_layer_has_names_and_descriptions(self, mgr):
+        prompt = mgr.inject_prompt(progressive=True)
+        # names + descriptions present
+        assert "test-skill" in prompt
+        assert "A test skill" in prompt
+        assert "another-skill" in prompt
+        assert "Another one" in prompt
+
+    def test_omits_full_bodies(self, mgr):
+        prompt = mgr.inject_prompt(progressive=True)
+        # full body content must NOT be injected up front
+        assert "Body content" not in prompt
+        assert "More body" not in prompt
+
+    def test_points_to_skill_md_path(self, mgr):
+        prompt = mgr.inject_prompt(progressive=True)
+        assert "SKILL.md" in prompt
+        assert "test-skill/SKILL.md" in prompt
+
+    def test_much_smaller_than_full_for_large_bodies(self, tmp_skill_dir):
+        # Progressive cost is bounded by description size, not body size —
+        # the win shows once bodies are realistically large.
+        big = Path(tmp_skill_dir) / "big-skill"
+        big.mkdir()
+        (big / "SKILL.md").write_text(
+            "---\nname: big-skill\ndescription: A big skill\n---\n\n"
+            + ("lorem ipsum body line\n" * 500)
+        )
+        mgr = SkillManager(tmp_skill_dir)
+        full = mgr.inject_prompt(progressive=False)
+        prog = mgr.inject_prompt(progressive=True)
+        assert len(prog) < len(full)
+        # progressive must not carry the large body
+        assert "lorem ipsum body line" not in prog
+
+    def test_disabled_notice_still_present(self, mgr):
+        mgr.disable("test-skill")
+        prompt = mgr.inject_prompt(progressive=True)
+        assert "DISABLED" in prompt
+        assert "test-skill" in prompt
+        # enabled skill still routed
+        assert "another-skill" in prompt
+
+    def test_skill_without_description_skipped(self, tmp_skill_dir):
+        s = Path(tmp_skill_dir) / "no-desc"
+        s.mkdir()
+        (s / "SKILL.md").write_text("---\nname: no-desc\n---\n\n# Body only\n\nstuff.")
+        mgr = SkillManager(tmp_skill_dir)
+        prompt = mgr.inject_prompt(progressive=True)
+        assert "no-desc" not in prompt
+
+    def test_full_mode_unchanged(self, mgr):
+        # default (progressive=False) still injects full bodies
+        prompt = mgr.inject_prompt()
+        assert "Body content" in prompt
+        assert "More body" in prompt
+
+
+# ============================================================================
+# keyword retrieval
+# ============================================================================
+
+@pytest.fixture
+def retrieval_mgr(tmp_skill_dir):
+    """Skill dir with a few skills carrying distinct descriptions."""
+    for name, desc in [
+        ("join-skill", "把样本表和特征表做 LEFT JOIN 拼接特征"),
+        ("face-skill", "比对两张人脸照片相似度判断是否同一人"),
+        ("sql-skill", "validate Hive SQL and submit async query jobs via tqs"),
+    ]:
+        d = Path(tmp_skill_dir) / name
+        d.mkdir()
+        (d / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: {desc}\n---\n\n# {name}\n\nbody."
+        )
+    return SkillManager(tmp_skill_dir)
+
+
+class TestKeywordRetrieval:
+    def test_tokenize_keeps_ascii_identifiers(self):
+        from chat.skill import _tokenize
+        toks = _tokenize("feature_join TQS")
+        assert "feature_join" in toks
+        assert "feature" in toks and "join" in toks
+        assert "tqs" in toks
+
+    def test_tokenize_cjk_unigram_and_bigram(self):
+        from chat.skill import _tokenize
+        toks = _tokenize("人脸相似")
+        assert "人" in toks  # unigram
+        assert "人脸" in toks  # bigram
+
+    def test_retrieve_ranks_relevant_skill_first(self, retrieval_mgr):
+        ranked = retrieval_mgr.retrieve("比对人脸照片是不是同一个人", top_k=3)
+        assert ranked  # non-empty
+        assert ranked[0][0] == "face-skill"
+
+    def test_retrieve_english_identifier_query(self, retrieval_mgr):
+        ranked = retrieval_mgr.retrieve("check Hive SQL syntax then submit tqs job", top_k=3)
+        assert ranked[0][0] == "sql-skill"
+
+    def test_retrieve_top_k_limits_results(self, retrieval_mgr):
+        ranked = retrieval_mgr.retrieve("特征 人脸 SQL", top_k=2)
+        assert len(ranked) <= 2
+
+    def test_retrieve_unrelated_query_returns_few(self, retrieval_mgr):
+        # query sharing no tokens with any description → no positive scores
+        ranked = retrieval_mgr.retrieve("zzz qqq xxx", top_k=5)
+        assert ranked == []
+
+    def test_inject_prompt_query_narrows_catalog(self, retrieval_mgr):
+        prompt = retrieval_mgr.inject_prompt(
+            progressive=True, query="拼接特征表", top_k=1
+        )
+        assert "join-skill" in prompt
+        # the unrelated skills should be filtered out of the routing layer
+        assert "face-skill" not in prompt
+        assert "sql-skill" not in prompt
+
+    def test_inject_prompt_no_query_keeps_all(self, retrieval_mgr):
+        prompt = retrieval_mgr.inject_prompt(progressive=True)
+        assert "join-skill" in prompt
+        assert "face-skill" in prompt
+        assert "sql-skill" in prompt
+
+
+# ============================================================================
+# LLM rerank (network mocked — best-effort semantic reorder)
+# ============================================================================
+
+class TestLLMRerank:
+    def test_rerank_reorders_by_llm_output(self, retrieval_mgr, monkeypatch):
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+        monkeypatch.setattr(
+            SkillManager, "_deepseek_rank",
+            staticmethod(lambda *a, **k: ["face-skill", "sql-skill", "join-skill"]),
+        )
+        out = retrieval_mgr.rerank("anything", ["join-skill", "sql-skill", "face-skill"])
+        assert out[0] == "face-skill"
+
+    def test_rerank_appends_dropped_candidates(self, retrieval_mgr, monkeypatch):
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+        # model drops "sql-skill" — it must still survive (recall safety)
+        monkeypatch.setattr(
+            SkillManager, "_deepseek_rank",
+            staticmethod(lambda *a, **k: ["face-skill", "join-skill"]),
+        )
+        out = retrieval_mgr.rerank("q", ["join-skill", "sql-skill", "face-skill"])
+        assert set(out) == {"join-skill", "sql-skill", "face-skill"}
+
+    def test_rerank_ignores_unknown_names(self, retrieval_mgr, monkeypatch):
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+        monkeypatch.setattr(
+            SkillManager, "_deepseek_rank",
+            staticmethod(lambda *a, **k: ["hallucinated", "face-skill"]),
+        )
+        out = retrieval_mgr.rerank("q", ["join-skill", "face-skill"])
+        assert "hallucinated" not in out
+        assert set(out) == {"join-skill", "face-skill"}
+
+    def test_rerank_falls_back_on_error(self, retrieval_mgr, monkeypatch):
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+        def boom(*a, **k):
+            raise RuntimeError("network down")
+        monkeypatch.setattr(SkillManager, "_deepseek_rank", staticmethod(boom))
+        cand = ["join-skill", "sql-skill", "face-skill"]
+        assert retrieval_mgr.rerank("q", cand) == cand
+
+    def test_rerank_no_key_returns_keyword_order(self, retrieval_mgr, monkeypatch):
+        monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+        cand = ["join-skill", "sql-skill"]
+        assert retrieval_mgr.rerank("q", cand) == cand
+
+    def test_rerank_top_k_truncates(self, retrieval_mgr, monkeypatch):
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+        monkeypatch.setattr(
+            SkillManager, "_deepseek_rank",
+            staticmethod(lambda *a, **k: ["face-skill", "sql-skill", "join-skill"]),
+        )
+        out = retrieval_mgr.rerank("q", ["join-skill", "sql-skill", "face-skill"], top_k=1)
+        assert out == ["face-skill"]
+
+    def test_inject_prompt_rerank_hook(self, retrieval_mgr, monkeypatch):
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
+        monkeypatch.setattr(
+            SkillManager, "_deepseek_rank",
+            staticmethod(lambda *a, **k: ["face-skill"]),
+        )
+        prompt = retrieval_mgr.inject_prompt(
+            progressive=True, query="人脸", top_k=1, rerank=True
+        )
+        assert "face-skill" in prompt
+
 # ============================================================================
 # install
 # ============================================================================
@@ -417,3 +612,79 @@ class TestFrontmatter:
         info = mgr.get_skill("dir-named")
         assert info is not None
         assert info.name == "dir-named"
+
+
+# ============================================================================
+# loader warns (not silent) AND recovers on broken frontmatter
+# ============================================================================
+
+class TestLoaderRecoversFromBrokenFrontmatter:
+    def test_missing_delimiters_warns_but_recovers(self, tmp_skill_dir, caplog):
+        """A pure-YAML SKILL.md (no '---') is recovered, not silently dropped."""
+        s = Path(tmp_skill_dir) / "broken-skill"
+        s.mkdir()
+        (s / "SKILL.md").write_text(
+            "name: broken-skill\ndescription: pure yaml, no delimiters\n"
+        )
+        mgr = SkillManager(tmp_skill_dir)
+        with caplog.at_level("WARNING", logger="chat.skill"):
+            skills = mgr.list_skills()
+        info = {sk.name: sk for sk in skills}.get("broken-skill")
+        assert info is not None
+        assert info.description == "pure yaml, no delimiters"
+        assert any(
+            "broken-skill" in r.message and "frontmatter" in r.message
+            for r in caplog.records
+        )
+
+    def test_markdown_escaped_underscores_recovered(self, tmp_skill_dir, caplog):
+        """`name: rule\\_generate` (markdown-escaped) recovers to rule_generate."""
+        s = Path(tmp_skill_dir) / "rule_generate"
+        s.mkdir()
+        (s / "SKILL.md").write_text(
+            "name: rule\\_generate\n"
+            'description: "触发词：rule\\_generate、规则生成。"\n'
+            "author: risk\\_recomm\\_team\n"
+        )
+        mgr = SkillManager(tmp_skill_dir)
+        with caplog.at_level("WARNING", logger="chat.skill"):
+            skills = mgr.list_skills()
+        info = {sk.name: sk for sk in skills}.get("rule_generate")
+        assert info is not None
+        assert "\\" not in info.name
+        assert "规则生成" in info.description
+
+    def test_star_and_longdash_noise_skipped(self, tmp_skill_dir):
+        """Leading `***` + long-dash block is treated as noise, name recovered."""
+        s = Path(tmp_skill_dir) / "sample_prepare"
+        s.mkdir()
+        (s / "SKILL.md").write_text(
+            "***\n\nname: sample\\_prepare\n"
+            'description: "从 Hive 表抽取样本。"\n'
+            + "-" * 80 + "\n\n# Sample Prepare\n"
+        )
+        mgr = SkillManager(tmp_skill_dir)
+        info = {sk.name: sk for sk in mgr.list_skills()}.get("sample_prepare")
+        assert info is not None
+        assert info.name == "sample_prepare"
+
+    def test_malformed_yaml_warns_and_recovers(self, tmp_skill_dir, caplog):
+        s = Path(tmp_skill_dir) / "bad-yaml"
+        s.mkdir()
+        # valid delimiters but YAML that fails to parse
+        (s / "SKILL.md").write_text(
+            "---\nname: bad-yaml\ndescription: \"unterminated\n---\n\nBody.\n"
+        )
+        mgr = SkillManager(tmp_skill_dir)
+        with caplog.at_level("WARNING", logger="chat.skill"):
+            skills = mgr.list_skills()
+        assert "bad-yaml" in {sk.name for sk in skills}
+        assert any(
+            "bad-yaml" in r.message and "malformed" in r.message
+            for r in caplog.records
+        )
+
+    def test_valid_skill_does_not_warn(self, mgr, caplog):
+        with caplog.at_level("WARNING", logger="chat.skill"):
+            mgr.list_skills()
+        assert not [r for r in caplog.records if "frontmatter" in r.message]
