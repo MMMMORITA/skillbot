@@ -267,8 +267,7 @@ class AgentMagic(Magics):
         self._busy = False                         # legacy — will be removed after refactor
         self._last_plan_prompt = ""
         self._last_plan_output = ""
-        self._last_user_prompt = ""                    # last raw user prompt, for playbook keying
-        self._playbook = None                          # lazy PlaybookStore (experience loop)
+        self._last_user_prompt = ""
         self._last_plan_result = None                  # cached ParsedResult for _implement_plan
         self._pending_result = None                    # ParsedResult waiting for user confirmation
         self._pending_gate = None                      # decision_gate dict waiting for human choice
@@ -310,73 +309,6 @@ class AgentMagic(Magics):
         if raw in ("pipeline", "exploration"):
             return raw
         return _UI_MODE_TO_EXEC.get(raw, "pipeline")
-
-    # ---- experience loop (playbook) ------------------------------------------
-
-    def _get_playbook(self):
-        """Lazily open the cross-session playbook store (survives session cleanup)."""
-        if self._playbook is None:
-            from pathlib import Path as _Path
-            from memory import PlaybookStore
-            root = _Path(__file__).resolve().parents[2]
-            self._playbook = PlaybookStore(str(root / ".run" / "playbook.jsonl"))
-        return self._playbook
-
-    def _recall_playbook(self, prompt: str) -> str:
-        """Return a compact few-shot block of past adopted decisions, or ""."""
-        try:
-            hits = self._get_playbook().recall(prompt, top_k=3)
-        except Exception:
-            _log.exception("playbook recall failed")
-            return ""
-        rec = get_recorder()
-        if rec:
-            rec.record("playbook_recall",
-                n_hits=len(hits),
-                top_score=hits[0][1] if hits else 0.0,
-            )
-        if not hits:
-            return ""
-        lines = [
-            "[System: Relevant past decisions the user adopted for similar requests. "
-            "Treat as precedent — reuse the chosen direction unless the current request "
-            "clearly differs.]"
-        ]
-        for entry, _score in hits:
-            piece = f"- Request: {entry.request}"
-            if entry.question:
-                piece += f" | Q: {entry.question}"
-            piece += f" | Chosen: {entry.chosen}"
-            lines.append(piece)
-        return "\n".join(lines) + "\n\n"
-
-    def _record_adopted_decision(self, gate: dict, chosen_label: str, chosen_evidence: str) -> None:
-        """Persist a human-adopted gate choice as a playbook entry (positive sample).
-
-        Uses ``upsert`` (not raw append) so re-deciding a similar request corrects
-        the prior precedent instead of stacking a duplicate/contradictory one.
-        """
-        request = self._last_user_prompt.strip()
-        if not request or not chosen_label:
-            return
-        try:
-            from memory import PlaybookEntry
-            action = self._get_playbook().upsert(PlaybookEntry(
-                request=request,
-                gate_type=gate.get("type", ""),
-                question=gate.get("question", ""),
-                chosen=chosen_label,
-                evidence=chosen_evidence,
-                mode=getattr(self, "_exec_mode", "pipeline"),
-            ))
-            rec = get_recorder()
-            if rec:
-                rec.record("playbook_upsert",
-                    action=action,
-                    gate_type=gate.get("type", ""),
-                )
-        except Exception:
-            _log.exception("playbook add failed")
 
     # ---- state machine helpers -----------------------------------------------
 
@@ -767,30 +699,13 @@ class AgentMagic(Magics):
                           pending_result=result)
 
     def _show_gate(self, gate: dict) -> None:
-        """Pause at a decision gate — show the human structured options + evidence.
-
-        Before showing, fold in any matching past decision (KnowSelf-style: recall
-        before re-asking). A prior adopted choice for a similar request pre-selects
-        the same option + adds a precedent hint — the full gate still shows, so a
-        genuine new divergence is never silently auto-answered.
-        """
-        hit = False
-        try:
-            request = (self._last_user_prompt or "").strip()
-            if request:
-                hit = self._get_playbook().annotate_gate(gate, request)
-        except Exception:
-            _log.exception("playbook gate annotation failed")
+        """Pause at a decision gate — show the human structured options + evidence."""
         self._state = AgentState.GATE_REVIEW
         self._record_state("gate_shown")
         self._busy = False
         self._pending_gate = gate
         rec = get_recorder()
         if rec:
-            rec.record("playbook_gate_annotated",
-                hit=hit,
-                gate_type=gate.get("type", ""),
-            )
             rec.record("decision_gate_shown",
                 gate_type=gate.get("type", ""),
                 question=gate.get("question", ""),
@@ -861,9 +776,6 @@ class AgentMagic(Magics):
             rec.record("decision_gate_choice",
                 choice=chosen_label, gate_type=gate.get("type", ""), index=idx,
             )
-        # Experience loop: a human-adopted gate choice is a positive sample —
-        # persist it as a playbook entry keyed by the request that triggered it.
-        self._record_adopted_decision(gate, chosen_label, chosen_evidence)
         send_to_panel(self.ns, "text", content=f"→ decision: {chosen_label}\n")
         self._state = AgentState.STREAMING
         self._record_state("gate_choice")
@@ -1248,12 +1160,6 @@ class AgentMagic(Magics):
         self._last_user_prompt = prompt
         ctx = self.ns.delta()
         full = f"{ctx}\n\n{prompt}" if ctx else prompt
-
-        # Experience loop: recall past adopted decisions for similar requests and
-        # inject them as a few-shot precedent block.
-        recall = self._recall_playbook(prompt)
-        if recall:
-            full = recall + full
 
         # Resolve this turn's execution posture. plan→exploration, auto→pipeline,
         # default→the session's current posture. If it differs from the posture that
