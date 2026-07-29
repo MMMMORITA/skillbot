@@ -37,10 +37,8 @@ SECTIONS = {
         "    Submit async SQL query.\n"
         "  %sql status|result|cancel --job_id ID\n"
         "    Manage async SQL jobs.\n"
-        "  %%agent [--timeout N] [--trace] [--auto]\n"
-        "    Execute task using AI agent. --trace triggers review, --auto auto-executes generated cells.\n"
-        "  %agent --trace [--auto]\n"
-        "    Trigger agent review of current cell.\n"
+        "  %%agent [--timeout N] [--auto]\n"
+        "    Execute task using AI agent. --auto auto-executes generated cells.\n"
         "  %fb yes|no [--comment '...']\n"
         "    Request user feedback.\n"
         '  %confirm yes|no|"message"\n'
