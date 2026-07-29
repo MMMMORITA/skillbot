@@ -1,0 +1,27 @@
+src/jupyter/magic.py
+  s_e91d526311ef04::t_da8b4d0da9cb81 346-348,351-352
+src/agent/session.py
+  s_e91d526311ef04::t_d09b49f4b17271 86-87,90,96
+  s_e91d526311ef04::t_ed3b879ec53455 123-124
+  s_e91d526311ef04::t_65263b198da4e0 178-179
+tests/agent/test_session_tools.py
+  s_e91d526311ef04::t_a2f57d18fb97ad 1-95
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "4a18f3540b7868fdcbeb2025db3c385e4ebc63a7",
+  "prompts": {},
+  "sessions": {
+    "s_e91d526311ef04": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a686a4b53d73b0d4f7bb357",
+        "model": "openrouter-3o__dev"
+      },
+      "human_author": "muruotong.01 <muruotong.01@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
