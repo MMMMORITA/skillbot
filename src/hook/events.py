@@ -5,7 +5,6 @@ from __future__ import annotations
 
 class HookEvent:
     CODE_REVIEW = "code_review"
-    AGENT_CELL_REVIEW = "agent_cell_review"
 
 
 class HookStatus:

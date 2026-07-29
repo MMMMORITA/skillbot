@@ -23,7 +23,6 @@ from .parser import parse
 from .render import render_debug, render_error, render_info, render_output, render_sql_dataframe
 from .dsl.sql import SqlRunner, sql_progress
 from hook.impl.code_review import AgentCodeReviewHook
-from hook.impl.cell_review import AgentCellReviewHook
 
 _log = logging.getLogger(__name__)
 
@@ -62,11 +61,6 @@ SUB_AGENT_DEFAULTS = {
         name="code_review",
         description="Review code cells for logic consistency",
         tools=["Read", "Grep", "Glob"],
-    ),
-    "cell_review": SubAgentConfig(
-        name="cell_review",
-        description="Review agent output and task progress",
-        tools=["Read"],
     ),
 }
 
@@ -234,11 +228,6 @@ def _register_hooks(timeout: int, hook_cfg: dict) -> None:
     cr_group = HookGroup("code_review", enabled=cr_cfg.get("enabled", True))
     cr_group.add(AgentCodeReviewHook())
     HookRegistry.register_group(cr_group, HookEvent.CODE_REVIEW)
-
-    cell_review_cfg = groups.get("agent_cell_review", {})
-    cell_review_group = HookGroup("agent_cell_review", enabled=cell_review_cfg.get("enabled", True))
-    cell_review_group.add(AgentCellReviewHook(timeout=timeout))
-    HookRegistry.register_group(cell_review_group, HookEvent.AGENT_CELL_REVIEW)
 
 
 class AgentState(Enum):

@@ -49,8 +49,7 @@ src/hook/
 ├── base.py                  # Hook (ABC), HookGroup, HookRegistry
 ├── events.py                # HookEvent, HookStatus, HookResult
 └── impl/
-    ├── code_review.py       # AgentCodeReviewHook（通过 SubAgentSession 执行）
-    └── cell_review.py       # AgentCellReviewHook（通过 SubAgentSession 执行）
+    └── code_review.py       # AgentCodeReviewHook（通过 SubAgentSession 执行）
 ```
 
 ## 架构
@@ -60,7 +59,7 @@ __init__ (extension 加载时)
   ├── logging 初始化 + Namespace(shell)
   ├── AgentSession(agent, timeout) → configure_subs + init_session
   │   └── SYSTEM_PROMPT + project prompt 合并 → seed prompt
-  │   └── _register_hooks → CODE_REVIEW + AGENT_CELL_REVIEW
+  │   └── _register_hooks → CODE_REVIEW
   ├── SessionEventRecorder + ns.delta() baseline
   └── init_panel_comm(shell) → 注册 comm target（前端主动创建）
 
@@ -96,7 +95,7 @@ AgentState 状态机（`magic.py:AgentState`）：
 Hook 执行
   ↓ dispatch(event, context, session=self._session)
   ├── hook.on_event(event, context, session)
-  │   └── session.get_sub("code_review|cell_review").execute(task)
+  │   └── session.get_sub("code_review").execute(task)
   │       └── SubAgentSession: 独立 client + session + seed prompt
   └── telemetry: record("hook_event", ...)
 ```
@@ -401,7 +400,6 @@ Agent 输出 JSON（code 字段统一由用户 cell 执行，不在 Bash 中运�
 ```python
 SUB_AGENT_DEFAULTS = {
     "code_review": SubAgentConfig(name="code_review", tools=["Read", "Grep", "Glob"]),
-    "cell_review": SubAgentConfig(name="cell_review", tools=["Read", "Bash"]),
 }
 ```
 

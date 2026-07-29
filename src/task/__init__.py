@@ -1,6 +1,5 @@
-"""Generic task framework — Task + TaskManager."""
+"""Generic task framework — Task."""
 
-from .manager import TaskManager
 from .task import Task
 
-__all__ = ["Task", "TaskManager"]
+__all__ = ["Task"]
