@@ -636,8 +636,7 @@ exports.STYLES = `
 .skillbot-plan-preview::-webkit-scrollbar-thumb { background: ${exports.CC.subtle}; border-radius: 2px; }
 
 /* ---- feedback textarea in confirm ---- */
-.skillbot-confirm-feedback,
-.skillbot-gate-feedback {
+.skillbot-confirm-feedback {
   background: ${exports.CC.bg};
   color: ${exports.CC.text};
   border: 1px solid ${exports.CC.border};
@@ -652,75 +651,13 @@ exports.STYLES = `
   box-sizing: border-box;
   transition: border-color 0.15s, box-shadow 0.15s;
 }
-.skillbot-confirm-feedback:focus,
-.skillbot-gate-feedback:focus {
+.skillbot-confirm-feedback:focus {
   border-color: ${exports.CC.accent};
   box-shadow: 0 0 0 3px rgba(0,180,180,0.12);
 }
-.skillbot-confirm-feedback::placeholder,
-.skillbot-gate-feedback::placeholder {
+.skillbot-confirm-feedback::placeholder {
   color: rgb(130,130,130);
   font-weight: 400;
-}
-
-/* ---- decision gate ---- */
-.skillbot-gate-badge {
-  display: inline-block;
-  align-self: flex-start;
-  background: ${exports.CC.surface};
-  color: ${exports.CC.brand};
-  font-size: 10px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  padding: 2px 8px;
-  border-radius: 3px;
-  margin-bottom: 2px;
-}
-.skillbot-gate-option {
-  padding: 10px 12px;
-  border-radius: 8px;
-  border: 1px solid ${exports.CC.border};
-  background: rgba(255,255,255,0.02);
-  color: rgb(180,180,180);
-  cursor: pointer;
-  transition: background 0.12s, color 0.12s, border-color 0.12s;
-}
-.skillbot-gate-option:hover {
-  background: rgba(255,255,255,0.05);
-  border-color: #454545;
-  color: ${exports.CC.text};
-}
-.skillbot-gate-option-active {
-  background: ${exports.CC.surface};
-  border-color: ${exports.CC.accent};
-  color: ${exports.CC.text};
-  box-shadow: 0 0 0 2px rgba(0,180,180,0.12);
-}
-.skillbot-gate-option-active .skillbot-gate-option-label::before {
-  content: '❯ ';
-  color: ${exports.CC.brand};
-  font-family: var(--sb-mono);
-}
-.skillbot-gate-option-label {
-  font-weight: 600;
-  font-size: 13px;
-}
-.skillbot-gate-rec {
-  font-size: 10px;
-  font-weight: 600;
-  color: ${exports.CC.brand};
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  margin-left: 6px;
-}
-.skillbot-gate-evidence {
-  margin-top: 4px;
-  font-size: 12px;
-  font-weight: 400;
-  line-height: 1.5;
-  color: rgb(160,160,160);
-  white-space: pre-wrap;
 }
 
 /* ---- skills view (upload / search / categories / toggle) ---- */

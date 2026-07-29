@@ -32,30 +32,6 @@ _INTERRUPT_NOTE = (
     "Respond ONLY to the current prompt below as if starting fresh.]"
 )
 
-# Frontend UI mode (default/plan/auto) → execution posture baked into the prompt.
-# plan is exploratory (surface options); default/auto drive deterministically.
-_UI_MODE_TO_EXEC = {
-    "plan": "exploration",
-    "auto": "pipeline",
-    "default": "pipeline",
-}
-
-# Per-turn directive prefixes — let a mid-session Shift+Tab switch take effect
-# without rebuilding the session's system prompt.
-_EXEC_MODE_DIRECTIVE = {
-    "exploration": (
-        "[System: EXPLORATION mode. Your deliverable is a decision for the human, not a finished "
-        "result. Investigate, gather evidence, and surface the real forks as a decision_gate "
-        "(2-4 options, each with concrete evidence). Do NOT write or execute task code until a "
-        "direction is chosen.]\n\n"
-    ),
-    "pipeline": (
-        "[System: PIPELINE mode. The request is well-scoped — proceed directly to a concrete "
-        "result. Only emit a decision_gate at a genuine human judgement point; otherwise finish "
-        "the task.]\n\n"
-    ),
-}
-
 SUB_AGENT_DEFAULTS = {
     "code_review": SubAgentConfig(
         name="code_review",
@@ -217,8 +193,8 @@ def _panel_restart_agent() -> None:
         inst._handle_panel_restart_agent()
 
 
-def _merge_prompt(claude_md_path: str | None = None, mode: str | None = None) -> str:
-    return PromptBuilder.main(claude_md_path, mode=mode)
+def _merge_prompt(claude_md_path: str | None = None) -> str:
+    return PromptBuilder.main(claude_md_path)
 
 
 def _register_hooks(timeout: int, hook_cfg: dict) -> None:
@@ -235,7 +211,6 @@ class AgentState(Enum):
     IDLE = auto()
     STREAMING = auto()           # agent is generating a response
     PLAN_REVIEW = auto()         # plan displayed, waiting for confirm/revision
-    GATE_REVIEW = auto()         # decision gate displayed, waiting for human choice
     WAITING_CONFIRM = auto()     # response ready, waiting for user yes/no before acting
     AUTO_FIXING = auto()         # deferred auto-fix in progress (auto mode)
 
@@ -259,7 +234,6 @@ class AgentMagic(Magics):
         self._last_user_prompt = ""
         self._last_plan_result = None                  # cached ParsedResult for _implement_plan
         self._pending_result = None                    # ParsedResult waiting for user confirmation
-        self._pending_gate = None                      # decision_gate dict waiting for human choice
         self._agent_cells: dict[str, str] = {}     # cell_id → code, for auto-fix lookup
         self._round_results: list[dict] = []        # [{cell_id, code, output}] for auto-fix lookup
         self._steps: list[dict] = []                # ordered step model: [{index,title,code,cell_id,status}]
@@ -278,26 +252,11 @@ class AgentMagic(Magics):
         # Load default config for hooks baseline, then auto-load from env var
         cfg = load_yaml_config("conf/jupyter_agent.yaml")
         self._hook_cfg = cfg.get("hooks", {})
-        self._exec_mode = self._resolve_exec_mode(cfg)  # session-level default posture
         self._startup_config_msg = self._load_jupyter_config()
         self.ns.delta()
         shell.events.register("post_run_cell", self._on_cell_run)
         from .panel import init_panel_comm
         init_panel_comm(shell)
-
-    @staticmethod
-    def _resolve_exec_mode(cfg: dict) -> str:
-        """Resolve the session-level execution posture.
-
-        Precedence: SKILLBOT_MODE env var > yaml ``mode`` key > "pipeline".
-        Accepts the exec names (pipeline/exploration) or UI-mode aliases
-        (default/auto/plan). Unknown values fall back to pipeline.
-        """
-        raw = (_os.environ.get("SKILLBOT_MODE") or cfg.get("mode") or "pipeline")
-        raw = str(raw).strip().lower()
-        if raw in ("pipeline", "exploration"):
-            return raw
-        return _UI_MODE_TO_EXEC.get(raw, "pipeline")
 
     # ---- state machine helpers -----------------------------------------------
 
@@ -310,21 +269,13 @@ class AgentMagic(Magics):
         self._auto_pending = 0
         self._auto_fix_count = 0
         self._pending_result = None
-        self._pending_gate = None
         self._round_results.clear()
         send_to_panel(self.ns, "text", content=msg)
         send_to_panel(self.ns, "result", summary="")
         send_to_panel(self.ns, "ready")
 
-    def _stream_with_interrupt(self, prompt: str, silent: bool = False) -> tuple[str, bool]:
-        """Stream agent response. Returns (raw_text, was_interrupted).
-
-        ``silent=True`` runs the model without surfacing anything to the panel —
-        used for internal round-trips (e.g. the decision-gate rescue) whose raw
-        output is machine-parsed, not shown. Without this the rescue's prose was
-        streamed to the panel on top of the original reply, so the user saw the
-        answer twice (three times once the plan card was added).
-        """
+    def _stream_with_interrupt(self, prompt: str) -> tuple[str, bool]:
+        """Stream agent response. Returns (raw_text, was_interrupted)."""
         if self._session_dirty:
             self._session_dirty = False
             prompt = _INTERRUPT_NOTE + "\n\n" + prompt
@@ -334,8 +285,7 @@ class AgentMagic(Magics):
         tool_names: set[str] = set()
 
         def _on_chunk(t):
-            if not silent:
-                send_to_panel(self.ns, "text", content=t)
+            send_to_panel(self.ns, "text", content=t)
 
         _think_buf = ""
         _think_last = 0.0
@@ -346,8 +296,7 @@ class AgentMagic(Magics):
             _think_buf += t
             now = time.time()
             if now - _think_last >= 0.2:
-                if not silent:
-                    send_thinking(_think_buf)
+                send_thinking(_think_buf)
                 _think_buf = ""
                 _think_last = now
 
@@ -359,15 +308,11 @@ class AgentMagic(Magics):
                 on_chunk=_on_chunk,
                 on_thinking=_on_thinking,
                 on_tool_use=_on_tool_use)
-            if _think_buf and not silent:
+            if _think_buf:
                 send_thinking(_think_buf)
-            if not silent:
-                send_to_panel(self.ns, "text", content="\n")
+            send_to_panel(self.ns, "text", content="\n")
             elapsed_ms = int((time.time() - t0) * 1000)
-            # Silent runs are internal round-trips (rescue), not real turns —
-            # recording them as agent_response pollutes telemetry with a phantom
-            # extra response for one prompt.
-            if rec and not silent:
+            if rec:
                 code_blocks = raw.count("```") // 2 if raw.strip() else 0
                 rec.record("agent_response",
                     mode=getattr(self, '_last_mode', 'default'),
@@ -402,7 +347,6 @@ class AgentMagic(Magics):
         self._busy = False
         self._auto_pending = 0
         self._pending_result = None
-        self._pending_gate = None
         self._round_results.clear()
         self._agent_cells.clear()
         if msg:
@@ -597,70 +541,17 @@ class AgentMagic(Magics):
             content=f"\n{'─'*40}\n{msg}\nType /continue yes or /continue no\n{'─'*40}\n")
         send_to_panel(self.ns, "continue_confirm", summary=msg)
 
-    # Prose patterns that signal the model is asking the human to pick between
-    # alternatives (rather than continue). Conservative — must co-occur with a
-    # question mark so plain statements never trip it.
-    _CHOICE_PATTERNS = (
-        # "X 还是 Y" — the classic Chinese "or" between named alternatives; with
-        # the required '?' this is almost always a pick, not rhetorical.
-        re.compile(r"还是"),
-        re.compile(r"你(?:想)?选|请选择|二选一|选择|选哪|挑(?:一)?个|哪(?:一)?个|哪种|"
-                   r"which\s+(?:option|approach|one|way|of)", re.I),
-        re.compile(r"(?:方案|方向|口径|选项|approach|option)\s*[一二三四1-4A-D]"),
-        re.compile(r"要不要|是否需要|需不需要"),
-        re.compile(r"\b[A-D]\s*(?:or|/|、)\s*[A-D]\b", re.I),
-    )
-
-    def _looks_like_choice(self, text: str) -> bool:
-        """True when the text reads like a human-facing A/B choice question."""
-        if not text or ("?" not in text and "？" not in text):
-            return False
-        return any(p.search(text) for p in self._CHOICE_PATTERNS)
-
-    def _rescue_gate_from_text(self, text: str) -> dict | None:
-        """One-shot re-prompt: ask the model to re-express a prose choice as a
-        structured decision_gate so the human gets the real option cards.
-
-        Fully guarded — any failure (provider down, interrupted, no gate parsed)
-        returns None so the caller falls back to echoing the question. Runs
-        through _stream_with_interrupt, so Stop still works during the rescue.
-        """
-        try:
-            directive = (
-                "[System: Your previous reply asked the human to choose between options in "
-                "prose. Re-express ONLY that choice as a structured decision_gate JSON: 2-4 "
-                "options, each with concrete evidence, at most one recommended=true, and a "
-                "one-line question. Output just the ```json block with a \"decision_gate\" "
-                "field — no other text, no code.]\n\nPrevious reply:\n" + text[:2000]
-            )
-            raw, interrupted = self._stream_with_interrupt(directive, silent=True)
-            if interrupted or not raw.strip():
-                return None
-            return parse(raw).decision_gate
-        except Exception:
-            _log.exception("gate rescue failed")
-            return None
-
     def _resolve_no_code(self, result) -> None:
-        """Fallback when the agent returned neither code nor a structured gate.
+        """Fallback when the agent returned neither code nor a gate.
 
         Old behavior blindly showed a blank "Continue?" Yes/No even when the
-        model was actually asking the human to pick between options — so the
-        buttons looked meaningless and hid where each answer led. Now:
-          1. if the prose reads like an A/B choice, try once to convert it into
-             a real decision_gate (surfacing the option+evidence cards);
-          2. failing that, echo the model's actual question as the confirm
-             prompt so Yes/No is at least intelligible;
-          3. otherwise fall back to the generic "Continue?".
+        model was actually asking the human a question — so the buttons looked
+        meaningless. Now: if the prose contains a question, echo the model's
+        actual question as the confirm prompt so Yes/No is at least intelligible;
+        otherwise fall back to the generic "Continue?".
         """
         text = (getattr(result, "text", "") or "").strip()
         has_question = ("?" in text) or ("？" in text)
-
-        if self._looks_like_choice(text):
-            gate = self._rescue_gate_from_text(text)
-            if gate:
-                self._show_gate(gate)
-                return
 
         if has_question and text:
             self._ask_confirm(text, pending_result=result)
@@ -704,113 +595,10 @@ class AgentMagic(Magics):
         self._ask_confirm(f"Generate and execute {len(result.code_list)} cells?",
                           pending_result=result)
 
-    def _show_gate(self, gate: dict) -> None:
-        """Pause at a decision gate — show the human structured options + evidence."""
-        self._state = AgentState.GATE_REVIEW
-        self._record_state("gate_shown")
-        self._busy = False
-        self._pending_gate = gate
-        rec = get_recorder()
-        if rec:
-            rec.record("decision_gate_shown",
-                gate_type=gate.get("type", ""),
-                question=gate.get("question", ""),
-                option_count=len(gate.get("options", [])),
-            )
-        send_to_panel(self.ns, "result", summary="")
-        send_to_panel(self.ns, "decision_gate", gate=gate)
-        send_to_panel(self.ns, "ready")
-
-    def _handle_gate_test(self) -> None:
-        """DEBUG: push a sample decision_gate through the real comm channel.
-
-        Lets you see the real panel component + round-trip (↑↓/Tab/Enter/click)
-        without depending on the model to emit a gate this turn. Choosing an
-        option routes through the normal ``/gate <idx>`` handler.
-        """
-        gate = {
-            "type": "direction",
-            "question": '按哪个口径定义"逾期"来做增益评估？',
-            "options": [
-                {
-                    "label": "DPD30+（逾期满 30 天）",
-                    "recommended": True,
-                    "evidence": "行业主流口径；hive 表 bnpl_loan_status 已有 dpd 字段，"
-                                "覆盖 SG 全量，样本 ~1200 万行，查询成本低（~40s）。",
-                },
-                {
-                    "label": "DPD1+（首逾）",
-                    "evidence": "更敏感但噪声大；需 join 还款流水表 bnpl_repay_flow，"
-                                "多一次 shuffle，成本约 3x。",
-                },
-                {
-                    "label": "自定义账龄窗口",
-                    "evidence": "需你补充窗口定义（如 7/14/60 天），当前无现成字段，要额外建临时表。",
-                },
-            ],
-        }
-        self._show_gate(gate)
-
-    def _handle_gate(self, arg: str) -> None:
-        """Handle /gate <index> from panel — feed the human's choice back to the agent."""
-        gate = self._pending_gate
-        self._pending_gate = None
-        if gate is None:
-            send_to_panel(self.ns, "text", content="No active decision.\n")
-            return
-        options = gate.get("options", [])
-        arg = arg.strip()
-        rec = get_recorder()
-        if arg == "cancel" or not arg:
-            if rec:
-                rec.record("decision_gate_choice", choice="cancel", gate_type=gate.get("type", ""))
-            self._finish_agent_run("Decision cancelled")
-            self._record_state("gate_cancel")
-            return
-        try:
-            idx = int(arg)
-        except ValueError:
-            idx = -1
-        if not (0 <= idx < len(options)):
-            # Free-text answer: treat as the human's decision verbatim.
-            chosen_label = arg
-            chosen_evidence = ""
-        else:
-            chosen_label = options[idx].get("label", "")
-            chosen_evidence = options[idx].get("evidence", "")
-        if rec:
-            rec.record("decision_gate_choice",
-                choice=chosen_label, gate_type=gate.get("type", ""), index=idx,
-            )
-        send_to_panel(self.ns, "text", content=f"→ decision: {chosen_label}\n")
-        self._state = AgentState.STREAMING
-        self._record_state("gate_choice")
-        self._busy = True
-        prompt = (
-            f"[System: The human answered the '{gate.get('type', '')}' decision gate.\n"
-            f"Question: {gate.get('question', '')}\n"
-            f"Chosen: {chosen_label}"
-            + (f"\nContext: {chosen_evidence}" if chosen_evidence else "")
-            + "]\n\nContinue the task based on this decision."
-        )
-        raw, interrupted = self._stream_with_interrupt(prompt)
-        if interrupted:
-            return
-        if not raw.strip():
-            self._finish_agent_run()
-            return
-        result = parse(raw)
-        if result.decision_gate:
-            self._show_gate(result.decision_gate)
-        elif result.code_list:
-            self._confirm_code_or_ask(result)
-        else:
-            self._resolve_no_code(result)
-
     def _reply_to_agent(self, text: str, kind: str = "continue") -> None:
         """Feed a free-text human reply back into the live session.
 
-        Powers the "type your answer" box on the confirm/gate overlays: instead
+        Powers the "type your answer" box on the confirm overlays: instead
         of a bare Yes/No, the human can answer the agent's question (a file path,
         a clarification) in prose. We drop any pending code (it was blocked on
         this very answer), echo the reply, and stream the continuation in the
@@ -821,7 +609,6 @@ class AgentMagic(Magics):
             send_to_panel(self.ns, "ready")
             return
         self._pending_result = None
-        self._pending_gate = None
         send_to_panel(self.ns, "text", content=f"↳ {text}\n")
         self._state = AgentState.STREAMING
         self._record_state(f"{kind}_reply")
@@ -841,9 +628,7 @@ class AgentMagic(Magics):
             self._finish_agent_run()
             return
         result = parse(raw)
-        if result.decision_gate:
-            self._show_gate(result.decision_gate)
-        elif result.code_list:
+        if result.code_list:
             self._confirm_code_or_ask(result)
         else:
             self._resolve_no_code(result)
@@ -900,9 +685,7 @@ class AgentMagic(Magics):
             self._finish_agent_run()
             return
         result = parse(raw)
-        if result.decision_gate:
-            self._show_gate(result.decision_gate)
-        elif result.code_list:
+        if result.code_list:
             self._confirm_code_or_ask(result)
         else:
             self._resolve_no_code(result)
@@ -1011,9 +794,8 @@ class AgentMagic(Magics):
     def _init_session(self, agent: str, timeout: int, claude_md: str | None = None) -> None:
         self._session = AgentSession(agent, timeout)
         self._session.configure_subs(SUB_AGENT_DEFAULTS)
-        self._session_prompt_mode = getattr(self, "_exec_mode", "pipeline")
         self._session.init_session(
-            system_prompt=_merge_prompt(claude_md, mode=self._session_prompt_mode),
+            system_prompt=_merge_prompt(claude_md),
             session_key=_session_key(),
             on_init=lambda s: _register_hooks(timeout, self._hook_cfg),
         )
@@ -1126,10 +908,6 @@ class AgentMagic(Magics):
                 send_to_panel(self.ns, "text", content="✗ No cells to snapshot.\n")
         elif text.startswith("/continue"):
             self._handle_continue(text[10:].strip())
-        elif text.startswith("/gatetest"):
-            self._handle_gate_test()
-        elif text.startswith("/gate"):
-            self._handle_gate(text[5:].strip())
         elif text == "/stop":
             self._handle_panel_stop()
         elif text.startswith("/cell-optimize"):
@@ -1167,22 +945,14 @@ class AgentMagic(Magics):
         ctx = self.ns.delta()
         full = f"{ctx}\n\n{prompt}" if ctx else prompt
 
-        # Resolve this turn's execution posture. plan→exploration, auto→pipeline,
-        # default→the session's current posture. If it differs from the posture that
-        # was baked into the system prompt, inject a directive so a mid-session switch
-        # takes effect without rebuilding the session.
-        if mode == "plan":
-            turn_mode = "exploration"
-        elif mode == "auto":
-            turn_mode = "pipeline"
-        else:
-            turn_mode = getattr(self, "_exec_mode", "pipeline")
-        baked_mode = getattr(self, "_session_prompt_mode", "pipeline")
-        if turn_mode != baked_mode:
-            full = _EXEC_MODE_DIRECTIVE.get(turn_mode, "") + full
-
         if mode == "plan":
             self._last_plan_prompt = prompt
+            plan_prefix = (
+                "[System: You are in plan mode. Explore the request, research the codebase, "
+                "and design an implementation approach. Present your plan as structured markdown. "
+                "Do NOT write or execute any code until the user confirms the plan.]\n\n"
+            )
+            full = plan_prefix + full
 
         # Stream
         self._state = AgentState.STREAMING
@@ -1203,25 +973,10 @@ class AgentMagic(Magics):
 
         # Process result
         result = parse(raw)
-        # Decision gate takes precedence: the agent is handing a judgement back to
-        # the human, so pause and show options regardless of mode.
-        if result.decision_gate:
-            self._show_gate(result.decision_gate)
-            return
         if mode == "plan":
             self._last_plan_output = raw.strip()
             self._last_plan_result = result  # cache parsed result to avoid re-parse in _implement_plan
             plan_text = result.plan or result.text or ""
-            # Plan mode still owes the human a decision when the "plan" is really
-            # a prose A/B/C choice (model listed 选项B/C/D instead of emitting a
-            # structured decision_gate). Rescue it into option cards — otherwise
-            # the old three-way "Approve this plan?" overlay hides where each
-            # branch leads. Falls back to the plan confirm on any rescue miss.
-            if self._looks_like_choice(plan_text):
-                gate = self._rescue_gate_from_text(plan_text)
-                if gate:
-                    self._show_gate(gate)
-                    return
             send_to_panel(self.ns, "plan_confirm", summary=plan_text)
             self._state = AgentState.PLAN_REVIEW
             self._busy = False
@@ -1244,15 +999,7 @@ class AgentMagic(Magics):
                 self._resolve_no_code(result)
 
     def _handle_panel_mode(self, mode: str) -> None:
-        """Handle /mode from panel — update the session's execution posture.
-
-        The frontend still tracks the UI mode (default/plan/auto) for interaction
-        rhythm; here we map it to the exec posture so subsequent default-mode turns
-        (and any freshly-built session) adopt it.
-        """
-        exec_mode = _UI_MODE_TO_EXEC.get(mode.strip().lower())
-        if exec_mode:
-            self._exec_mode = exec_mode
+        """Handle /mode from panel — mode is tracked by frontend, nothing to persist."""
 
     def _skill_mgr(self):
         """Return the live SkillManager, or a fresh one for the configured agent.
@@ -1342,7 +1089,6 @@ class AgentMagic(Magics):
         self._last_plan_result = None
         self._last_user_prompt = ""
         self._pending_result = None
-        self._pending_gate = None
 
     def _handle_panel_clear(self) -> None:
         """Handle /clear — wipe the visible panel AND the agent's memory.

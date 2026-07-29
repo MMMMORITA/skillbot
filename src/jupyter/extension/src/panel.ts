@@ -6,7 +6,6 @@ import { Menu } from '@lumino/widgets';
 import { CC, STYLES } from './panelStyles';
 import * as R from './panelRenderer';
 import * as PC from './panelPlanConfirm';
-import * as DG from './panelDecisionGate';
 import * as ST from './panelSteps';
 import * as SK from './panelSkills';
 import * as SS from './panelSessions';
@@ -71,14 +70,6 @@ class AgentPanel extends Widget {
   private _continueOptionIdx: 0 | 1 | 2 = 0;
   private _continueSummary = '';
   private _continueFeedbackMode = false;
-
-  // decision gate (scope/direction/gain/launch — dynamic 2-4 options)
-  private _gateActive = false;
-  private _gateOptionIdx = 0;
-  private _gateOptions: any[] = [];
-  private _gateQuestion = '';
-  private _gateFeedbackMode = false;
-  private _gateType = '';
 
   // message block
   private _currentBlock: HTMLElement | null = null;
@@ -177,7 +168,7 @@ class AgentPanel extends Widget {
       if (sel && sel.type !== 'None' && sel.toString().length > 0) return;
       if (this._planConfirmActive) {
         this._confirmWrapper.focus();
-      } else if (this._gateActive || this._continueConfirmActive) {
+      } else if (this._continueConfirmActive) {
         this._confirmWrapper.focus();
       } else {
         this._inputEl.focus();
@@ -246,53 +237,6 @@ class AgentPanel extends Widget {
   // ---- keyboard -----------------------------------------------------------
 
   private _onKeydown(e: KeyboardEvent): void {
-    // decision gate: dynamic option selection (2-4 options + "type an answer")
-    if (this._gateActive) {
-      // Feedback mode: typing flows into the textarea; intercept Enter/Esc.
-      if (this._gateFeedbackMode) {
-        if (e.key === 'Enter' && !e.shiftKey && !e.metaKey && !e.altKey && !e.isComposing) {
-          e.preventDefault(); e.stopPropagation();
-          this._submitDecisionGate();
-          return;
-        }
-        if (e.key === 'Escape') {
-          e.preventDefault(); e.stopPropagation();
-          this._gateFeedbackMode = false;
-          this._renderGateOptions();
-          this._confirmWrapper.focus();
-          return;
-        }
-        return;  // Shift+Enter, arrows, etc. pass through natively
-      }
-      const n = (this._gateOptions.length || 0) + 1;  // +1 trailing "type an answer"
-      if (e.key === 'ArrowUp' || (e.key === 'Tab' && e.shiftKey)) {
-        e.preventDefault(); e.stopPropagation();
-        this._gateOptionIdx = (this._gateOptionIdx - 1 + n) % n;
-        this._renderGateOptions();
-        this._confirmWrapper.focus();
-        return;
-      }
-      if (e.key === 'ArrowDown' || e.key === 'Tab') {
-        e.preventDefault(); e.stopPropagation();
-        this._gateOptionIdx = (this._gateOptionIdx + 1) % n;
-        this._renderGateOptions();
-        this._confirmWrapper.focus();
-        return;
-      }
-      if (e.key === 'Enter') {
-        e.preventDefault(); e.stopPropagation();
-        this._submitDecisionGate();
-        return;
-      }
-      if (e.key === 'Escape' || ((e.ctrlKey || e.metaKey) && e.key === 'c')) {
-        e.preventDefault(); e.stopPropagation();
-        this._cancelDecisionGate();
-        return;
-      }
-      e.preventDefault();
-      return;
-    }
-
     // continue confirm: Yes/No selection (plan-style overlay)
     if (this._continueConfirmActive) {
       // Feedback mode: let typing flow into the textarea, intercept Enter/Esc.
@@ -1361,13 +1305,6 @@ class AgentPanel extends Widget {
   private _submitPlanConfirm(): void { PC.submitPlanConfirm(this); }
   private _cancelPlanConfirm(): void { PC.cancelPlanConfirm(this); }
 
-  // ---- decision gate (delegates to panelDecisionGate) ---------------------
-
-  private _renderDecisionGate(gate: any): void { DG.renderDecisionGate(this, gate); }
-  private _renderGateOptions(): void { DG.renderGateOptions(this); }
-  private _submitDecisionGate(): void { DG.submitDecisionGate(this); }
-  private _cancelDecisionGate(): void { DG.cancelDecisionGate(this); }
-
   // ---- continue confirmation (plan-style overlay) --------------------------
 
   private _renderContinueButtons(summary: string): void {
@@ -1695,17 +1632,6 @@ class AgentPanel extends Widget {
             this._busy = false;
             this._dequeueNext();
             this._renderContinueButtons(d.summary || '');
-            break;
-          case 'decision_gate':
-            if (this._planConfirmActive) this._closeConfirm();
-            this._stopSpinner();
-            this._streaming = false;
-            this._responseStarted = false;
-            this._busy = false;
-            this._dequeueNext();
-            this._setStatus('⏸', 'decision');
-            this._renderDecisionGate(d.gate || {});
-            this._saveState();
             break;
           case 'ready':
             this._stopSpinner();
