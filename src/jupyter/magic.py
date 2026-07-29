@@ -343,9 +343,13 @@ class AgentMagic(Magics):
                 _think_last = now
 
         try:
+            def _on_tool_use(name):
+                tool_names.add(name)
+
             raw = self._session.stream(prompt, show_text=False,
                 on_chunk=_on_chunk,
-                on_thinking=_on_thinking)
+                on_thinking=_on_thinking,
+                on_tool_use=_on_tool_use)
             if _think_buf:
                 send_thinking(_think_buf)
             send_to_panel(self.ns, "text", content="\n")
