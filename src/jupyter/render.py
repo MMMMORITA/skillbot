@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
 import sys
 from io import StringIO
 from pathlib import Path
@@ -60,11 +62,14 @@ def render_error(text: str) -> None:
 
 def render_code(ns: Namespace, code: str, auto: bool = False,
                 cell_type: str = "code", replace_cell_id: str = "",
-                on_cell_id: callable | None = None) -> None:
+                on_cell_id: callable | None = None,
+                run_below: bool = False, run_cell_ids: list | None = None) -> None:
     """Send code to frontend via comm; extension creates cell + optionally executes."""
     if not code:
         return
     code = code.strip()
+    if cell_type != "markdown":
+        code = _inline_hidden_scripts(code)
     if cell_type == "markdown":
         pass
     else:
@@ -76,7 +81,8 @@ def render_code(ns: Namespace, code: str, auto: bool = False,
 
     from .comm import send_cell_via_comm
     send_cell_via_comm(ns, code, auto=auto, cell_type=cell_type,
-                       replace_cell_id=replace_cell_id, on_cell_id=on_cell_id)
+                       replace_cell_id=replace_cell_id, on_cell_id=on_cell_id,
+                       run_below=run_below, run_cell_ids=run_cell_ids)
 
 
 def render_variables(ns: Namespace) -> None:
@@ -99,6 +105,7 @@ def render_image(data: bytes) -> None:
 def render_sql_dataframe(ns: Namespace, data: dict, var_name: str):
     """Load SQL result into namespace as DataFrame. Returns the DataFrame or None."""
     sample = data.get("sample_data", [])
+    df_sample = None
     if sample and len(sample) > 1:
         cols = sample[0]
         rows = sample[1:1001]  # max 1000 rows for preview display
@@ -119,6 +126,10 @@ def render_sql_dataframe(ns: Namespace, data: dict, var_name: str):
         ns.inject(var_name, df)
         render_text(f"[{var_name}] loaded from {result_url}: {len(df)} rows x {len(df.columns)} cols")
         return df
+    elif df_sample is not None:
+        # Spark Connect returns rows inline (no persisted file) — use the sample.
+        ns.inject(var_name, df_sample)
+        return df_sample
     else:
         render_text(f"\033[91m[{var_name}] no data available\033[0m")
         return None
@@ -174,6 +185,88 @@ def render_output(ns: Namespace, result: ParsedResult,
 # ---------------------------------------------------------------------------
 # internal helpers
 # ---------------------------------------------------------------------------
+
+
+# Matches the two shim shapes the agent uses to hide real code in a home-dir
+# file and just load/run it from the cell:
+#   exec(open('/Users/x/foo.py').read())
+#   subprocess.run(["python3", "/Users/x/foo.py"], ...)  /  os.system("python3 /Users/x/foo.py")
+_EXEC_OPEN_RE = re.compile(
+    r"""exec\s*\(\s*open\s*\(\s*['"](?P<path>[^'"]+\.py)['"]\s*\)\s*\.\s*read\s*\(\s*\)\s*\)"""
+)
+_RUN_PY_RE = re.compile(
+    r"""(?:subprocess\.\w+|os\.system|os\.popen)\s*\([^)]*?['"]?(?P<path>/[^'"\s,\]]+\.py)['"]?"""
+)
+
+
+def _expand_home(path: str) -> Path:
+    return Path(os.path.expanduser(path)).resolve() if path else Path()
+
+
+def _inline_hidden_scripts(code: str) -> str:
+    """Hard guardrail: the agent must deliver code AS cells, not stash it in a
+    standalone .py under the user's home dir and load it via a shim. When a cell
+    is just ``exec(open('~/foo.py').read())`` or a subprocess/os.system runner
+    pointing at such a file, splice the real file contents back into the cell and
+    delete the hidden file — the kernel is the runtime, nothing runs off-notebook.
+
+    Only home-dir files are inlined+removed; /tmp/ tool scratch is left alone.
+    Non-shim code is returned untouched. Best-effort: any failure returns the
+    original code so we never break a legitimate cell.
+    """
+    try:
+        m = _EXEC_OPEN_RE.search(code) or _RUN_PY_RE.search(code)
+        if not m:
+            return code
+        raw_path = m.group("path")
+        shim = "exec_open" if _EXEC_OPEN_RE.search(code) else "subprocess_run"
+        target = _expand_home(raw_path)
+        # Only touch files under the user's home dir; leave /tmp/ scratch alone.
+        try:
+            home = Path.home().resolve()
+            if home not in target.parents and target != home:
+                return code
+        except Exception:
+            return code
+        if not target.is_file():
+            _log.warning("render_code: shim points at missing file %s; leaving cell as-is", raw_path)
+            _record_guardrail_hit("hidden_script_missing", raw_path, shim=shim, inlined=False)
+            return code
+        body = target.read_text()
+        _log.warning(
+            "render_code: inlined hidden script %s (%d chars) into cell and removed the file "
+            "(agent tried to run code off-notebook)", raw_path, len(body),
+        )
+        _record_guardrail_hit("hidden_script_inlined", raw_path, shim=shim,
+                              inlined=True, body_chars=len(body))
+        try:
+            target.unlink()
+        except Exception:
+            pass
+        header = f"# [skillbot] inlined from {raw_path} (agent must deliver code as cells, not a hidden .py)\n"
+        return header + body.strip()
+    except Exception:
+        return code
+
+
+def _record_guardrail_hit(kind: str, path: str, **fields) -> None:
+    """Log a guardrail violation durably, and best-effort into session telemetry.
+
+    Durable JSONL is the source of truth (survives crash / no live session);
+    the session recorder mirror is best-effort so per-session views still show it.
+    """
+    try:
+        from .guardrail_log import record_violation
+        record_violation(kind, path=path, **fields)
+    except Exception:
+        _log.exception("guardrail durable log failed")
+    try:
+        from .telemetry import get_recorder
+        rec = get_recorder()
+        if rec:
+            rec.record("guardrail_violation", kind=kind, path=path, **fields)
+    except Exception:
+        pass
 
 
 def _is_sql(code: str) -> bool:

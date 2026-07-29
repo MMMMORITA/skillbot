@@ -12,11 +12,20 @@ _log = logging.getLogger(__name__)
 
 
 def send_cell_via_comm(ns, code: str, auto: bool = False, cell_type: str = "code",
-                       replace_cell_id: str = "", on_cell_id: callable | None = None) -> str:
+                       replace_cell_id: str = "", on_cell_id: callable | None = None,
+                       run_below: bool = False, run_cell_ids: list | None = None) -> str:
     """Notify frontend extension to create + optionally execute a cell.
 
     Fire-and-forget: creates a comm, registers on_msg for async reply,
     does NOT block or poll. The comm stays alive to receive the reply.
+
+    ``run_below`` asks the frontend to re-run this cell *and every cell below it*
+    (runAllBelow) instead of just this one — the blunt fallback when we can't
+    resolve a precise dependency slice.
+
+    ``run_cell_ids`` is the precise alternative: an ordered list of cell ids to
+    re-run (the changed cell followed by only its true downstream dependents). When
+    present it takes precedence over ``run_below``/``auto`` on the frontend.
     """
     if len(code) > _MAX_CODE_SIZE:
         _log.warning("send_cell_via_comm: code too large (%d bytes), truncating", len(code))
@@ -33,7 +42,9 @@ def send_cell_via_comm(ns, code: str, auto: bool = False, cell_type: str = "code
             warnings.simplefilter("ignore", RuntimeWarning)
             comm = create_comm(TARGET_NAME,
                                data={"code": code, "auto": auto, "cell_type": cell_type,
-                                      "replace_cell_id": replace_cell_id})
+                                      "replace_cell_id": replace_cell_id,
+                                      "run_below": run_below,
+                                      "run_cell_ids": run_cell_ids or []})
 
             @comm.on_msg
             def _on_msg(msg):

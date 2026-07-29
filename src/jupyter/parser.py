@@ -128,62 +128,6 @@ def _from_code_fence_or_text(text: str) -> ParsedResult:
     return result
 
 
-def parse_review_result(raw: str) -> dict:
-    """Parse agent review output.
-
-    Returns ``{"status": str|None, "code": str|None}``.
-
-    status: ``"SOLVED"`` | ``"NOT_SOLVED"`` | ``"SOLVING"`` | ``None``
-    """
-    import json as _json
-    from .render import render_debug
-    render_debug(f"parse_review_result input ({len(raw)} chars)")
-    _log.debug(raw[:5000])
-
-    # Try JSON: fenced first, then raw
-    data = None
-    m = _JSON_FENCE.search(raw)
-    if m:
-        try:
-            data = _json.loads(m.group(1))
-        except _json.JSONDecodeError:
-            pass
-    if data is None and raw.strip().startswith("{"):
-        try:
-            data = _json.loads(raw.strip())
-        except _json.JSONDecodeError:
-            pass
-
-    if data:
-        status = str(data.get("text") or "").strip().upper()
-        reason = str(data.get("reason") or "").strip()
-        code = data.get("code") or None
-        if isinstance(code, list):
-            code = code[0] if code else None
-        code = str(code).strip() if code else None
-        text = data.get("text", "")
-        # Normalize status
-        if "NOT_SOLVED" in status:
-            status = "NOT_SOLVED"
-        elif "SOLVED" in status:
-            status = "SOLVED"
-        elif code:
-            status = "SOLVING"
-        else:
-            status = None
-    else:
-        # Plain text fallback
-        desc = raw.strip().upper()
-        status = "NOT_SOLVED" if "NOT_SOLVED" in desc else ("SOLVED" if "SOLVED" in desc else None)
-        reason = raw.strip()[:500]
-        code = None
-        text = raw.strip()
-
-    is_markdown = _has_markdown(text) if text else False
-
-    return {"status": status, "code": code, "reason": reason, "text": text, "is_markdown": is_markdown}
-
-
 def traceback_line(tb) -> int:
     """Return the source line number from the LAST frame of a traceback."""
     import traceback

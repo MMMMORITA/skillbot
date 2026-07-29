@@ -6,4 +6,6 @@ export declare function renderTool(panel: any, name: string): void;
 export declare function renderThinking(panel: any, content: string): void;
 export declare function renderCodeBlock(panel: any, _language: string, code: string): void;
 export declare function renderPlanBlock(panel: any, text: string): void;
+export declare function planStreamTarget(panel: any): HTMLElement;
+export declare function finalizePlanBlock(panel: any, text: string): void;
 export declare function renderResult(panel: any, summary: string): void;

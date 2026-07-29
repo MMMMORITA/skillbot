@@ -28,17 +28,33 @@ __all__ = [
 _AGENTS = {"deer-flow", "nanobot", "hermes-agent", "claude-code"}
 
 _PROJECT_DIR = Path(__file__).resolve().parents[2]
+
+# Agents whose runtime skill directory lives under $HOME (config is synced there
+# by run.sh, e.g. conf/agent_conf/hermes-agent -> ~/.hermes). For these the UI
+# must read the *same* directory the agent loads from, not the project copy —
+# otherwise the skill list shown to the user drifts from what the agent uses.
+_AGENT_HOME_SKILL_PATHS: dict[str, str] = {
+    "hermes-agent": ".hermes/skills",
+}
+
 _AGENT_SKILL_PATHS: dict[str, str] = {
     "claude-code": ".claude/skills",
     "deer-flow": "skills/custom",
     "nanobot": "nanobot/skills",
-    "hermes-agent": "skills/custom",
+    "hermes-agent": "skills",
 }
 
 
 def _resolve_skill_dir(agent: str) -> str:
-    """Resolve the skill directory for an agent."""
+    """Resolve the skill directory an agent actually loads from.
+
+    hermes-agent reads ~/.hermes/skills at runtime (config is synced there by
+    run.sh). An explicit SKILL_BOT_AGENT_INSTALL_DIR override still wins so
+    tests and custom installs can redirect it.
+    """
     install_dir = os.environ.get("SKILL_BOT_AGENT_INSTALL_DIR", "")
+    if not install_dir and agent in _AGENT_HOME_SKILL_PATHS:
+        return str(Path.home() / _AGENT_HOME_SKILL_PATHS[agent])
     base = Path(install_dir) if install_dir else _PROJECT_DIR / "agents"
     return str(base / agent / _AGENT_SKILL_PATHS.get(agent, "skills"))
 
@@ -96,6 +112,17 @@ class ChatClient:
         (SDK handles full loading at startup).
         Other agents: injects full skill body via SkillManager.inject_prompt().
         """
+        # Keyword retrieval narrows the catalog per message, so the catalog
+        # depends on `content` — bypass the config-version cache when active.
+        topk = self._skill_topk()
+        if topk and self._agent != "claude-code":
+            progressive = self._progressive_enabled()
+            prompt = self.skills.inject_prompt(
+                progressive=progressive, query=content, top_k=topk,
+                rerank=self._rerank_enabled(),
+            )
+            return prompt + "\n\n" + content if prompt else content
+
         current = (
             tuple(self.skills.active_skills),
             tuple(self.skills.disabled_skills),
@@ -127,11 +154,32 @@ class ChatClient:
                 parts.append(f"skill DISABLED (do NOT use): {', '.join(sorted(disabled))}")
             return "[System note: skill configuration changed]\n" + "\n".join(parts) + "\n\n" + content
 
-        # Non-claude agents: full prompt injection
-        prompt = self.skills.inject_prompt()
+        # Non-claude agents: prompt injection.
+        # Progressive mode (env-gated) injects only a routing layer
+        # (name + description + path) instead of every skill's full body,
+        # so enabling many skills no longer blows up the context window.
+        prompt = self.skills.inject_prompt(progressive=self._progressive_enabled())
         if prompt:
             return prompt + "\n\n" + content
         return content
+
+    @staticmethod
+    def _progressive_enabled() -> bool:
+        return os.environ.get("SKILLBOT_PROGRESSIVE_SKILLS", "") not in ("", "0", "false")
+
+    @staticmethod
+    def _skill_topk() -> int:
+        """Catalog narrowing via keyword retrieval; 0/unset disables it."""
+        raw = os.environ.get("SKILLBOT_SKILL_TOPK", "")
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            return 0
+
+    @staticmethod
+    def _rerank_enabled() -> bool:
+        """LLM rerank on the keyword candidate pool; off by default."""
+        return os.environ.get("SKILLBOT_SKILL_RERANK", "") not in ("", "0", "false")
 
     # ------------------------------------------------------------------
     # public API

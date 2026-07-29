@@ -6,6 +6,9 @@ import { Menu } from '@lumino/widgets';
 import { CC, STYLES } from './panelStyles';
 import * as R from './panelRenderer';
 import * as PC from './panelPlanConfirm';
+import * as ST from './panelSteps';
+import * as SK from './panelSkills';
+import * as SS from './panelSessions';
 
 const TARGET = 'skillbot:tui';
 let _panelInstance: AgentPanel | null = null;
@@ -14,7 +17,14 @@ let _panelInstance: AgentPanel | null = null;
 // ===========================================================================
 
 class AgentPanel extends Widget {
-  private static STORAGE_KEY = 'skillbot-panel';
+  // Per-notebook conversation buffers and the session registry live in
+  // localStorage; keys and all the session-management logic are in
+  // panelSessions.ts (SS.*). Instance state (below) stays on this class.
+  private _currentPath: string = '';        // notebook path of the buffer currently shown
+  private _sessionsCollapsed: boolean = false;  // session list collapsed → compact strip
+  private _app: JupyterFrontEnd | null = null;  // for docmanager open/new
+  private _sessionBarEl!: HTMLElement;      // session switcher UI
+  private _actionBarEl!: HTMLElement;       // agent action buttons (stop / clear / ...)
   private _root: ShadowRoot;
   private _outputEl: HTMLElement;
   private _inputEl: HTMLTextAreaElement;
@@ -41,6 +51,7 @@ class AgentPanel extends Widget {
   // info bar (mode switch messages)
   private _infoEl: HTMLElement;
   private _infoTimer: any = null;
+  private _persistTimer: any = null;                // debounce for auto-saving agent-inserted cells
 
   // mode (cc-haha style: Shift+Tab to cycle)
   private _mode: 'default' | 'plan' | 'auto' = 'default';
@@ -56,8 +67,9 @@ class AgentPanel extends Widget {
 
   // continue confirmation (plan/default mode loop)
   private _continueConfirmActive = false;
-  private _continueOptionIdx: 0 | 1 = 0;
+  private _continueOptionIdx: 0 | 1 | 2 = 0;
   private _continueSummary = '';
+  private _continueFeedbackMode = false;
 
   // message block
   private _currentBlock: HTMLElement | null = null;
@@ -65,16 +77,22 @@ class AgentPanel extends Widget {
   private _responseStarted = false;
   private _textEl: HTMLElement | null = null;  // accumulated text element for streaming
   _thinkingEl: HTMLElement | null = null;      // accumulated thinking element
+  _planEl: HTMLElement | null = null;          // plan card wrapper (streaming plan mode)
+  _planBodyEl: HTMLElement | null = null;      // plan card body the prose streams into
   private _thinkingCollapsed = true;            // Ctrl+T to toggle collapse
   private _busy = false;                        // agent is working → queue new prompts
   private _promptQueue: Array<{text: string, mode: 'default' | 'plan' | 'auto'}> = [];
   private _skillsMode = false;                   // skills view active → input hidden
+  private _stepsMode = false;                     // steps timeline view active → input hidden
+  private _stepData: Array<{index: number, title: string, code: string, cell_id: string, status: string}> = [];
 
   constructor() {
     super();
     this.id = 'skillbot:tui';
     this.title.label = 'Agent';
     this.title.closable = true;
+
+    try { this._sessionsCollapsed = localStorage.getItem(SS.COLLAPSE_KEY) === '1'; } catch (_) {}
 
     // Light-DOM min styles (just enough for JupyterLab to lay out the panel)
     this.node.style.display = 'flex';
@@ -99,6 +117,11 @@ class AgentPanel extends Widget {
     `;
     this._root.appendChild(welcome);
 
+    // session switcher bar — one tab per known notebook conversation
+    this._sessionBarEl = document.createElement('div');
+    this._sessionBarEl.className = 'skillbot-session-bar';
+    this._root.appendChild(this._sessionBarEl);
+
     // output — click to focus input + keyboard for Ctrl+T
     this._outputEl = document.createElement('div');
     this._outputEl.className = 'skillbot-output';
@@ -115,6 +138,11 @@ class AgentPanel extends Widget {
       if (e.key === 'Escape' && this._skillsMode && this._expandedIdx === -1) {
         e.preventDefault();
         this._exitSkillsMode();
+      }
+      // Esc exits steps timeline view
+      if (e.key === 'Escape' && this._stepsMode) {
+        e.preventDefault();
+        this._exitStepsMode();
       }
       // Esc cancels config pending when output is focused
       if (e.key === 'Escape' && this._configPending) {
@@ -140,6 +168,8 @@ class AgentPanel extends Widget {
       if (sel && sel.type !== 'None' && sel.toString().length > 0) return;
       if (this._planConfirmActive) {
         this._confirmWrapper.focus();
+      } else if (this._continueConfirmActive) {
+        this._confirmWrapper.focus();
       } else {
         this._inputEl.focus();
       }
@@ -151,6 +181,11 @@ class AgentPanel extends Widget {
     this._statusEl.className = 'skillbot-status';
     this._statusEl.innerHTML = '<span>○ idle</span><span>skillbot</span>';
     this._root.appendChild(this._statusEl);
+
+    // action bar — visible buttons for common agent controls
+    this._actionBarEl = document.createElement('div');
+    this._actionBarEl.className = 'skillbot-action-bar';
+    this._root.appendChild(this._actionBarEl);
 
     // input
     this._inputWrapper = document.createElement('div');
@@ -195,6 +230,8 @@ class AgentPanel extends Widget {
     this._root.appendChild(this._infoEl);
 
     this._restoreState();
+    this._renderSessionBar();
+    this._renderActionBar();
   }
 
   // ---- keyboard -----------------------------------------------------------
@@ -202,15 +239,33 @@ class AgentPanel extends Widget {
   private _onKeydown(e: KeyboardEvent): void {
     // continue confirm: Yes/No selection (plan-style overlay)
     if (this._continueConfirmActive) {
+      // Feedback mode: let typing flow into the textarea, intercept Enter/Esc.
+      if (this._continueFeedbackMode) {
+        if (e.key === 'Enter' && !e.shiftKey && !e.metaKey && !e.altKey && !e.isComposing) {
+          e.preventDefault(); e.stopPropagation();
+          this._submitContinue();
+          return;
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault(); e.stopPropagation();
+          this._continueFeedbackMode = false;
+          this._renderContinueOptions();
+          this._confirmWrapper.focus();
+          return;
+        }
+        // Shift+Enter, arrows, etc. pass through to the textarea natively.
+        return;
+      }
+      const n = 3;  // Yes / No / Type an answer
       if (e.key === 'ArrowUp' || (e.key === 'Tab' && e.shiftKey)) {
         e.preventDefault(); e.stopPropagation();
-        this._continueOptionIdx = (this._continueOptionIdx === 0 ? 1 : 0);
+        this._continueOptionIdx = ((this._continueOptionIdx + n - 1) % n) as 0|1|2;
         this._renderContinueOptions();
         return;
       }
       if (e.key === 'ArrowDown' || e.key === 'Tab') {
         e.preventDefault(); e.stopPropagation();
-        this._continueOptionIdx = (this._continueOptionIdx === 0 ? 1 : 0);
+        this._continueOptionIdx = ((this._continueOptionIdx + 1) % n) as 0|1|2;
         this._renderContinueOptions();
         return;
       }
@@ -736,8 +791,23 @@ class AgentPanel extends Widget {
     const idx = AgentPanel.MODE_ORDER.indexOf(this._mode);
     this._mode = AgentPanel.MODE_ORDER[(idx + 1) % AgentPanel.MODE_ORDER.length];
     this._updateModeInfo();
+    this._renderActionBar();
     this._saveState();
     // notify backend silently — no agent execution
+    if (this._kernel) {
+      this._kernel.requestExecute({
+        code: `get_ipython().user_ns['_panel_set_mode']("${this._mode}")`,
+        store_history: false,
+      });
+    }
+  }
+
+  /** Plan button: toggle between plan and default (same sync path as Shift+Tab). */
+  private _togglePlanMode(): void {
+    this._mode = this._mode === 'plan' ? 'default' : 'plan';
+    this._updateModeInfo();
+    this._renderActionBar();
+    this._saveState();
     if (this._kernel) {
       this._kernel.requestExecute({
         code: `get_ipython().user_ns['_panel_set_mode']("${this._mode}")`,
@@ -815,6 +885,7 @@ class AgentPanel extends Widget {
     const isDisplay = this._isDisplayCommand(text);
     if (!isSlash) {
       this._busy = true;
+      this._syncActionBar();
     }
     if (isDisplay) {
       // Skills commands enter dedicated view
@@ -856,10 +927,10 @@ class AgentPanel extends Widget {
       future.onIOPub = (msg: any) => {
         if (msg.header.msg_type === 'stream' && msg.content?.name === 'stdout') {
           if (firstStdout) {
-            this._renderResponseText(this._ansiToHtml(msg.content.text));
+            this._renderResponseText(msg.content.text);
             firstStdout = false;
           } else {
-            this._appendTextChunk(this._ansiToHtml(msg.content.text));
+            this._appendTextChunk(msg.content.text);
           }
         }
       };
@@ -880,6 +951,8 @@ class AgentPanel extends Widget {
     this._responseStarted = false;
     this._textEl = null;
     this._thinkingEl = null;
+    this._planEl = null;
+    this._planBodyEl = null;
   }
 
   private _appendToBlock(el: HTMLElement): void {
@@ -897,7 +970,8 @@ class AgentPanel extends Widget {
   private _renderTool(name: string): void { R.renderTool(this, name); }
   private _renderThinking(content: string): void { R.renderThinking(this, content); }
   private _renderCodeBlock(l: string, c: string): void { R.renderCodeBlock(this, l, c); }
-  private _renderPlanBlock(text: string): void { R.renderPlanBlock(this, text); }
+  private _planStreamTarget(): void { R.planStreamTarget(this); }
+  private _finalizePlanBlock(text: string): void { R.finalizePlanBlock(this, text); }
   private _renderResult(summary: string): void { R.renderResult(this, summary); }
 
   // ---- skill rendering ----
@@ -905,368 +979,40 @@ class AgentPanel extends Widget {
   private _skillRows: HTMLElement[] = [];
   private _skillSelectedIdx: number = 0;
   private _skillListWrapper: HTMLElement | null = null;
-  private _skillData: Array<{name: string, description: string, enabled: boolean, body: string}> = [];
+  private _skillData: Array<{name: string, description: string, enabled: boolean, body: string, category: string}> = [];
   private _expandedIdx: number = -1;   // -1=list, >=0=info view
   private _fullBodyIdx: number = -1;   // -1=not in full body, >=0=full body view
-  private _installMode = false;        // showing install path input
-  private _installError = '';          // error message from last install
+  private _skillFilter = '';           // live search box text
+  private _collapsedCats: Set<string> = new Set();  // collapsed category groups
+  private _skillNoticeTimer: any = null;            // auto-clear for _showSkillNotice
   private _configPending = false;      // waiting for config confirm (y/n)
   private _commandDropdown: HTMLElement;  // slash command autocomplete
   private _commands: string[];
   private _commandIdx: number = -1;
 
-  private _enterSkillsMode(): void {
-    this._skillsMode = true;
-    this._inputWrapper.style.display = 'none';
-    this._outputEl.querySelectorAll('.skillbot-skill-list').forEach(el => el.remove());
-  }
+  // ---- skills view (impl in panelSkills.ts) -------------------------------
 
-  private _exitSkillsMode(): void {
-    this._skillsMode = false;
-    this._inputWrapper.style.display = '';
-    this._skillRows = [];
-    this._skillSelectedIdx = 0;
-    this._expandedIdx = -1;
-    this._outputEl.querySelectorAll('.skillbot-skill-list').forEach(el => el.remove());
-    this._inputEl.focus();
-    // Reset textarea height (lost during display:none)
-    setTimeout(() => this._resizeInput(), 0);
-  }
+  private _enterSkillsMode(): void { SK.enterSkillsMode(this); }
+  private _exitSkillsMode(): void { SK.exitSkillsMode(this); }
 
-  private _renderSkillList(skills: Array<{name: string, description: string, enabled: boolean, body?: string}>): void {
-    this._skillData = skills.map(s => ({...s, body: s.body || ''}));
-    this._skillRows = [];
-    this._skillSelectedIdx = 0;
-    this._expandedIdx = -1;
-    this._fullBodyIdx = -1;
-    this._installMode = false;
-    this._installError = '';
+  // ---- steps timeline view (impl in panelSteps.ts) -------------------------
 
-    // Remove old list, rebuild
-    this._outputEl.querySelectorAll('.skillbot-skill-list').forEach(el => el.remove());
+  private _enterStepsMode(): void { ST.enterStepsMode(this); }
+  private _exitStepsMode(): void { ST.exitStepsMode(this); }
+  private _renderStepList(steps: Array<{index: number, title: string, code: string, cell_id: string, status: string}>): void { ST.renderStepList(this, steps); }
+  private _rerunStep(step: {cell_id: string}): void { ST.rerunStep(this, step); }
+  private _rollbackStep(step: {cell_id: string}): void { ST.rollbackStep(this, step); }
+  private _reviseStep(step: {cell_id: string, code: string, index: number, title?: string}): Promise<void> { return ST.reviseStep(this, step); }
+  private _showStepNotice(msg: string): void { ST.showStepNotice(this, msg); }
 
-    const wrapper = document.createElement('div');
-    wrapper.className = 'skillbot-skill-list';
-    wrapper.tabIndex = 0;
-    wrapper.style.outline = 'none';
-    wrapper.innerHTML = `<div style="font-size:13px;font-weight:600;color:${CC.text};margin-bottom:4px;padding:0 4px;">Skills</div>`;
+  /** Bridge so panelSteps can open the (module-scope) cell-snapshots dialog. */
+  private _showCellSnapshots(cell: any, versions: any[]): void { _showCellSnapshotsDialog(cell, versions, this); }
 
-    const listEl = document.createElement('div');
-    listEl.className = 'skillbot-skill-items';
-    wrapper.appendChild(listEl);
 
-    const hint = document.createElement('div');
-    hint.className = 'skillbot-skill-hint';
-    hint.style.cssText = `font-size:10px;color:rgb(120,120,120);margin-top:4px;padding:0 4px;`;
-    hint.textContent = skills.length === 0
-      ? 'Press i to install from .zip  Esc close'
-      : '↑↓ select  Enter details  Space toggle  d uninstall  i install  Esc close';
-    wrapper.appendChild(hint);
+  private _renderSkillList(skills: Array<{name: string, description: string, enabled: boolean, body?: string, category?: string}>): void { SK.renderSkillList(this, skills); }
 
-    wrapper.addEventListener('keydown', (e) => this._onSkillKeydown(e));
-    this._skillListWrapper = wrapper;
-    this._outputEl.appendChild(wrapper);
-    this._scrollBottom();
-    this._refreshSkillRows();
-    // Focus wrapper so keyboard nav works (input is hidden in skills mode)
-    setTimeout(() => wrapper.focus(), 50);
-    // Focus the list so keyboard nav works (input is hidden in skills mode)
-    setTimeout(() => wrapper.focus(), 50);
-  }
-
-  private _onSkillKeydown(e: KeyboardEvent): void {
-    // Install mode handled separately
-    if (this._installMode) {
-      if (e.key === 'Escape') {
-        e.preventDefault(); e.stopPropagation();
-        this._installMode = false;
-        this._refreshSkillRows();
-        setTimeout(() => this._skillListWrapper?.focus(), 0);
-      }
-      return;
-    }
-
-    // Level 3: full body view — only Esc → back to info
-    if (this._fullBodyIdx !== -1) {
-      if (e.key === 'Escape') {
-        e.preventDefault(); e.stopPropagation();
-        this._fullBodyIdx = -1;
-        this._refreshSkillRows();
-        setTimeout(() => this._skillListWrapper?.focus(), 0);
-      }
-      return;
-    }
-
-    // Level 2: info view — Enter → full body, Esc → list
-    if (this._expandedIdx !== -1) {
-      if (e.key === 'Enter') {
-        e.preventDefault(); e.stopPropagation();
-        this._fullBodyIdx = this._expandedIdx;
-        this._refreshSkillRows();
-        setTimeout(() => this._skillListWrapper?.focus(), 0);
-        return;
-      }
-      if (e.key === 'Escape') {
-        e.preventDefault(); e.stopPropagation();
-        this._expandedIdx = -1;
-        this._fullBodyIdx = -1;
-        this._refreshSkillRows();
-        setTimeout(() => this._skillListWrapper?.focus(), 0);
-      }
-      return;
-    }
-
-    const skills = this._skillData;
-
-    // Allow install + exit even when list is empty
-    if (!skills.length) {
-      if (e.key === 'i') {
-        e.preventDefault(); e.stopPropagation();
-        this._installMode = true;
-        this._installError = '';
-        this._refreshSkillRows();
-      } else if (e.key === 'Escape') {
-        e.preventDefault(); e.stopPropagation();
-        this._exitSkillsMode();
-      }
-      return;
-    }
-
-    switch (e.key) {
-      case 'i':
-        // Install — show inline path input
-        e.preventDefault(); e.stopPropagation();
-        this._installMode = true;
-        this._installError = '';
-        this._refreshSkillRows();
-        // Focus the input after render
-        setTimeout(() => {
-          const inp = this._skillListWrapper?.querySelector('.skillbot-install-input') as HTMLInputElement;
-          inp?.focus();
-        }, 50);
-        break;
-      case 'd':
-        // Uninstall — requires double-tap for safety
-        e.preventDefault(); e.stopPropagation();
-        const toRemove = skills[this._skillSelectedIdx];
-        if (!toRemove) break;
-        // Show confirmation hint
-        const hintEl = this._skillListWrapper?.querySelector('.skillbot-skill-hint') as HTMLElement | null;
-        if (hintEl) {
-          hintEl.textContent = `Press d again to confirm uninstall of "${toRemove.name}" (any other key to cancel)`;
-          hintEl.style.color = 'rgb(220,120,100)';
-        }
-        // Wait for second keypress (auto-cancel after 3s)
-        let cancelled = false;
-        const cancelTimer = setTimeout(() => {
-          cancelled = true;
-          this._skillListWrapper?.removeEventListener('keydown', onConfirm);
-          if (hintEl) { hintEl.style.color = ''; }
-          this._refreshSkillRows();
-        }, 3000);
-        const onConfirm = (e2: KeyboardEvent) => {
-          if (cancelled) return;
-          clearTimeout(cancelTimer);
-          this._skillListWrapper?.removeEventListener('keydown', onConfirm);
-          if (hintEl) { hintEl.style.color = ''; }
-          if (e2.key === 'd') {
-            if (this._kernel) {
-              this._kernel.requestExecute({
-                code: `get_ipython().user_ns['_panel_input']('/skills uninstall ${toRemove.name}')`,
-                store_history: false,
-              });
-            }
-            this._skillData.splice(this._skillSelectedIdx, 1);
-            this._skillSelectedIdx = Math.min(this._skillSelectedIdx, this._skillData.length - 1);
-            this._refreshSkillRows();
-          } else {
-            this._refreshSkillRows(); // reset hint
-          }
-        };
-        setTimeout(() => {
-          this._skillListWrapper?.addEventListener('keydown', onConfirm, { once: false });
-        }, 0);
-        break;
-      case 'Tab':
-      case 'ArrowDown':
-        e.preventDefault(); e.stopPropagation();
-        this._skillSelectedIdx = Math.min(skills.length - 1, this._skillSelectedIdx + 1);
-        this._refreshSkillRows();
-        break;
-      case 'ArrowUp':
-        e.preventDefault(); e.stopPropagation();
-        this._skillSelectedIdx = Math.max(0, this._skillSelectedIdx - 1);
-        this._refreshSkillRows();
-        break;
-      case 'Enter':
-        e.preventDefault(); e.stopPropagation();
-        this._expandedIdx = this._skillSelectedIdx;
-        this._refreshSkillRows();
-        break;
-      case ' ':
-        e.preventDefault(); e.stopPropagation();
-        const s = skills[this._skillSelectedIdx];
-        if (s && this._kernel) {
-          s.enabled = !s.enabled;
-          this._refreshSkillRows();
-          this._kernel.requestExecute({
-            code: `get_ipython().user_ns['_panel_input']('/skills toggle ${s.name}')`,
-            store_history: false,
-          });
-        }
-        break;
-      case 'Escape':
-        e.preventDefault(); e.stopPropagation();
-        this._exitSkillsMode();
-        break;
-    }
-  }
-
-  private _refreshSkillRows(): void {
-    const listEl = this._skillListWrapper?.querySelector('.skillbot-skill-items') as HTMLElement;
-    if (!listEl) return;
-    listEl.innerHTML = '';
-    this._skillRows = [];
-
-    // Empty state in list area
-    if (!this._installMode && this._skillData.length === 0) {
-      const empty = document.createElement('div');
-      empty.style.cssText = `padding:12px 4px;font-size:12px;color:rgb(120,120,120);text-align:center;`;
-      empty.textContent = 'No skills installed';
-      listEl.appendChild(empty);
-    }
-
-    // Install mode: show input row
-    if (this._installMode) {
-      const row = document.createElement('div');
-      row.style.cssText = `padding:4px;display:flex;gap:6px;align-items:center;`;
-      const input = document.createElement('input');
-      input.className = 'skillbot-install-input';
-      input.type = 'text';
-      input.placeholder = 'path/to/skill.zip';
-      input.style.cssText = `flex:1;background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.15);color:${CC.text};padding:4px 8px;border-radius:3px;font-size:12px;outline:none;`;
-      input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-          e.preventDefault(); e.stopPropagation();
-          const path = input.value.trim();
-          if (path && this._kernel) {
-            this._kernel.requestExecute({
-              code: `get_ipython().user_ns['_panel_input']('/skills install ${path.replace(/'/g, "\\'")}')`,
-              store_history: false,
-            });
-          }
-          // Close input, wait for skill_list refresh
-          this._installMode = false;
-          this._refreshSkillRows();
-          setTimeout(() => this._skillListWrapper?.focus(), 0);
-        }
-        if (e.key === 'Escape') {
-          e.preventDefault(); e.stopPropagation();
-          this._installMode = false;
-          this._refreshSkillRows();
-          setTimeout(() => this._skillListWrapper?.focus(), 0);
-        }
-      });
-      row.appendChild(input);
-      const label = document.createElement('span');
-      label.style.cssText = `font-size:10px;color:rgb(140,140,140);white-space:nowrap;`;
-      label.textContent = 'Enter to install';
-      row.appendChild(label);
-      listEl.appendChild(row);
-      // Show last error
-      if (this._installError) {
-        const errRow = document.createElement('div');
-        errRow.style.cssText = `padding:4px;font-size:11px;color:rgb(220,120,100);`;
-        errRow.textContent = this._installError;
-        listEl.appendChild(errRow);
-      }
-    }
-    this._skillData.forEach((s, i) => {
-      const selected = i === this._skillSelectedIdx;
-      const expanded = i === this._expandedIdx;
-      const row = document.createElement('div');
-      row.style.cssText = `padding:2px 4px;border-radius:3px;background:${selected ? 'rgba(255,255,255,0.08)' : ''};`;
-
-      const header = document.createElement('div');
-      header.style.cssText = `display:flex;align-items:center;gap:8px;cursor:pointer;`;
-      const dot = s.enabled
-        ? `<span style="color:rgb(100,200,100);font-size:14px;">●</span>`
-        : `<span style="color:rgb(200,100,100);font-size:14px;">●</span>`;
-      const status = s.enabled ? 'enabled' : 'disabled';
-      const statusColor = s.enabled ? 'rgb(100,200,100)' : 'rgb(200,100,100)';
-      header.innerHTML = `${dot} <span style="color:${CC.text};font-size:12px;">${this._esc(s.name)}</span> <span style="color:${statusColor};font-size:10px;margin-left:auto;">${status}</span>`;
-      row.appendChild(header);
-
-      if (expanded) {
-        const showFull = this._fullBodyIdx === i;
-        const detail = document.createElement('div');
-        detail.style.cssText = `margin:6px 0 4px 22px;font-size:11px;color:rgb(180,180,180);line-height:1.5;`;
-        if (showFull) {
-          // Level 3: full SKILL.md body
-          detail.innerHTML = `<div style="color:${CC.text};background:rgba(255,255,255,0.04);padding:8px;border-radius:3px;max-height:350px;overflow-y:auto;white-space:pre-wrap;font-size:11px;line-height:1.4;">${this._esc(s.body || '')}</div>`;
-        } else {
-          // Level 2: info view (description + truncated body)
-          detail.innerHTML = `<div style="margin-bottom:4px;">${this._esc(s.description)}</div>`;
-          if (s.body) {
-            const bodyText = s.body.slice(0, 1000);
-            detail.innerHTML += `<div style="color:${CC.text};background:rgba(255,255,255,0.03);padding:6px;border-radius:3px;max-height:150px;overflow-y:auto;white-space:pre-wrap;font-size:11px;">${this._esc(bodyText)}${s.body.length > 1000 ? '...' : ''}</div>`;
-          }
-        }
-        row.appendChild(detail);
-      }
-      listEl.appendChild(row);
-      this._skillRows.push(row);
-    });
-
-    const hintEl = this._skillListWrapper?.querySelector('.skillbot-skill-hint');
-    if (hintEl) {
-      if (this._installMode) {
-        hintEl.textContent = 'Enter install path to skill.zip  Esc cancel';
-      } else if (this._skillData.length === 0) {
-        hintEl.textContent = 'Press i to install from .zip  Esc close';
-      } else if (this._fullBodyIdx !== -1) {
-        hintEl.textContent = 'Esc back to info';
-      } else if (this._expandedIdx !== -1) {
-        hintEl.textContent = 'Enter full body  Esc back to list';
-      } else {
-        hintEl.textContent = '↑↓ select  Enter details  Space toggle  d uninstall  i install  Esc close';
-      }
-    }
-  }
-
-  private _renderSkillInfo(skill: {name: string, description: string, enabled: boolean, body: string, path: string}): void {
-    const wrapper = document.createElement('div');
-    wrapper.className = 'skillbot-skill-info';
-
-    const dot = skill.enabled
-      ? `<span style="color:rgb(100,200,100);font-size:16px;">●</span>`
-      : `<span style="color:rgb(200,100,100);font-size:16px;">●</span>`;
-
-    const header = document.createElement('div');
-    header.style.cssText = `font-size:14px;font-weight:600;color:${CC.text};margin-bottom:4px;`;
-    header.innerHTML = `${dot} ${this._esc(skill.name)}`;
-
-    const meta = document.createElement('div');
-    meta.style.cssText = `font-size:12px;color:rgb(180,180,180);margin-bottom:8px;line-height:1.5;`;
-    meta.innerHTML = `
-      ${this._esc(skill.description)}<br>
-      <span style="color:rgb(140,140,140);">Status:</span> ${skill.enabled ? 'enabled' : 'disabled'}<br>
-      <span style="color:rgb(140,140,140);">Path:</span> ${this._esc(skill.path)}
-    `;
-
-    const bodyText = (skill.body || '').slice(0, 1500);
-    const bodyWrap = document.createElement('div');
-    bodyWrap.style.cssText = `font-size:12px;color:${CC.text};background:rgba(255,255,255,0.04);padding:8px;border-radius:4px;max-height:200px;overflow-y:auto;white-space:pre-wrap;line-height:1.4;`;
-    bodyWrap.textContent = bodyText;
-    if ((skill.body || '').length > 1500) {
-      bodyWrap.textContent += '\n\n... (truncated)';
-    }
-
-    wrapper.appendChild(header);
-    wrapper.appendChild(meta);
-    wrapper.appendChild(bodyWrap);
-    this._appendToBlock(wrapper);
-  }
+  /** Flash a short backend message (upload/uninstall result) above the list. */
+  private _showSkillNotice(msg: string): void { SK.showSkillNotice(this, msg); }
 
   // ---- thinking collapse (Ctrl+T) ----
 
@@ -1352,29 +1098,129 @@ class AgentPanel extends Widget {
     this._mode = savedMode;
   }
 
-  // ---- persistence (localStorage) ----
+  // ---- session persistence + switcher (impl in panelSessions.ts) ----------
 
-  private _saveState(): void {
+  private _storageKey(path?: string): string { return SS.storageKey(this, path); }
+  private _saveState(): void { SS.saveState(this); }
+  private _restoreState(): void { SS.restoreState(this); }
+  private _loadBuffer(path: string): void { SS.loadBuffer(this, path); }
+  private _applyBuffer(raw: string): void { SS.applyBuffer(this, raw); }
+  private _loadRegistry(): Record<string, string> { return SS.loadRegistry(this); }
+  private _saveRegistry(reg: Record<string, string>): void { SS.saveRegistry(this, reg); }
+  private _registerSession(path: string): void { SS.registerSession(this, path); }
+  private _renderSessionBar(): void { SS.renderSessionBar(this); }
+
+  /** Public: called by the plugin when a notebook file is deleted from disk. */
+  onNotebookFileDeleted(path: string): void { SS.onNotebookFileDeleted(this, path); }
+
+  // ---- agent action bar ---------------------------------------------------
+
+  /** Run a slash command from a button without disturbing the user's draft/history. */
+  private _dispatchCommand(cmd: string): void {
+    const draft = this._inputEl.value;
+    const histLen = this._history.length;
+    this._inputEl.value = cmd;
+    this._sendPrompt();
+    // _sendPrompt pushes to history — button-issued commands shouldn't pollute it.
+    if (this._history.length > histLen && this._history[this._history.length - 1] === cmd) {
+      this._history.pop();
+      this._historyIdx = -1;
+    }
+    // Restore whatever the user was typing (input is hidden in skills mode).
+    if (draft && !this._skillsMode) {
+      this._inputEl.value = draft;
+      this._resizeInput();
+    }
+  }
+
+  /** Interrupt the running kernel immediately (same as Ctrl+C twice). */
+  private _interruptAgent(): void {
+    this._kernel?.interrupt();
+    this._setStatus('⏏', 'interrupted');
+    this._stopSpinner();
+    this._busy = false;
+    this._promptQueue = [];
+    this._updateStatusDisplay();
+  }
+
+  /** Render the visible agent controls; enable/disable by busy state. */
+  private _renderActionBar(): void {
+    if (!this._actionBarEl) return;
+    this._actionBarEl.innerHTML = '';
+
+    const mk = (label: string, title: string, cls: string, on: () => void): HTMLElement => {
+      const b = document.createElement('span');
+      b.className = 'skillbot-action-btn' + (cls ? ' ' + cls : '');
+      b.textContent = label;
+      b.title = title;
+      b.addEventListener('click', (e) => { e.preventDefault(); on(); });
+      return b;
+    };
+
+    // Stop is prominent while busy, muted otherwise.
+    const stop = mk('■ Stop', '停止当前任务 (/stop)', 'skillbot-action-stop', () => {
+      if (this._busy) this._interruptAgent();
+      this._dispatchCommand('/stop');
+    });
+    if (!this._busy) stop.classList.add('disabled');
+    this._actionBarEl.appendChild(stop);
+
+    // Plan is a toggle: switch into plan mode, or back to default if active.
+    const plan = mk('⏸ Plan', 'Plan 模式开关 (Shift+Tab)', 'skillbot-action-plan', () => this._togglePlanMode());
+    if (this._mode === 'plan') plan.classList.add('active');
+    this._actionBarEl.appendChild(plan);
+
+    this._actionBarEl.appendChild(mk('🗑 Clear', '清空当前会话对话', '', () => this._dispatchCommand('/clear')));
+
+    // Steps is a toggle: open the timeline view, or close it if already open.
+    const steps = mk('☰ Steps', '步骤时间线：每步可单独重跑/回退/修正', 'skillbot-action-steps', () => {
+      if (this._stepsMode) this._exitStepsMode();
+      else this._enterStepsMode();
+    });
+    if (this._stepsMode) steps.classList.add('active');
+    this._actionBarEl.appendChild(steps);
+
+    // Skills is a toggle: open the manager, or close it if already open.
+    const skills = mk('≣ Skills', '管理技能 (/skills)', 'skillbot-action-skills', () => {
+      if (this._skillsMode) this._exitSkillsMode();
+      else this._dispatchCommand('/skills');
+    });
+    if (this._skillsMode) skills.classList.add('active');
+    this._actionBarEl.appendChild(skills);
+  }
+
+  /** Called by the plugin when the active notebook changes. Returns true if the
+   *  active path actually changed (so the caller can notify the backend). */
+  setActivePath(path: string): boolean {
+    if (!path || path === this._currentPath) {
+      if (path) this._registerSession(path);
+      return false;
+    }
+    this._saveState();
+    this._currentPath = path;
+    this._loadBuffer(path);
+    this._registerSession(path);
+    this._renderSessionBar();
+    return true;
+  }
+
+  /** Notify the backend to give this notebook its own agent conversation. The
+   *  AgentMagic session is kernel-wide, so without this a new/other notebook
+   *  would inherit the previous notebook's LLM history. Must run after the
+   *  kernel for the target notebook is connected. Backend guards against
+   *  spurious/duplicate switches and won't reset mid-task. */
+  notifyNotebookSwitch(path: string): void {
+    if (!path || !this._kernel) return;
     try {
-      localStorage.setItem(AgentPanel.STORAGE_KEY, JSON.stringify({
-        output: this._outputEl.innerHTML,
-        history: this._history,
-        mode: this._mode,
-        status: this._statusEl.innerHTML,
-      }));
+      this._kernel.requestExecute({
+        code: `get_ipython().user_ns['_panel_switch_notebook'](${JSON.stringify(path)})`,
+        store_history: false,
+      });
     } catch (_) {}
   }
 
-  private _restoreState(): void {
-    try {
-      const raw = localStorage.getItem(AgentPanel.STORAGE_KEY);
-      if (!raw) return;
-      const s = JSON.parse(raw);
-      if (s.output) { this._outputEl.innerHTML = s.output; this._scrollBottom(); }
-      if (s.history) this._history = s.history;
-      if (s.mode) { this._mode = s.mode; this._updateModeInfo(); }
-      if (s.status) this._statusEl.innerHTML = s.status;
-    } catch (_) {}
+  setApp(app: JupyterFrontEnd): void {
+    this._app = app;
   }
 
   // ---- spinner -------------------------------------------------------------
@@ -1438,6 +1284,15 @@ class AgentPanel extends Widget {
     } else {
       this._statusEl.innerHTML = `<span>${icon} ${label}${q}</span><span>skillbot</span>`;
     }
+    this._syncActionBar();
+  }
+
+  /** Keep the Stop button's enabled/prominent state in sync with busy. */
+  private _syncActionBar(): void {
+    const stop = this._actionBarEl?.querySelector('.skillbot-action-stop');
+    if (!stop) return;
+    if (this._busy) stop.classList.remove('disabled');
+    else stop.classList.add('disabled');
   }
 
   // ---- plan confirmation (delegates to panelPlanConfirm) ------------------
@@ -1455,6 +1310,7 @@ class AgentPanel extends Widget {
   private _renderContinueButtons(summary: string): void {
     this._continueConfirmActive = true;
     this._continueOptionIdx = 0;
+    this._continueFeedbackMode = false;
     this._continueSummary = summary;
     this._renderContinueOptions();
     this._inputWrapper.style.display = 'none';
@@ -1463,10 +1319,15 @@ class AgentPanel extends Widget {
   }
 
   private _renderContinueOptions(): void {
+    // Preserve any typed answer across re-render (innerHTML drops the textarea).
+    const oldTa = this._confirmWrapper.querySelector('.skillbot-confirm-feedback') as HTMLTextAreaElement;
+    const saved = oldTa ? oldTa.value : '';
+
     const summary = this._continueSummary;
     const options = [
       'Yes — generate and execute cells',
       'No — finish here',
+      '✎ Type an answer instead…',
     ];
     const optionsHtml = options.map((label, i) => {
       const cls = i === this._continueOptionIdx
@@ -1475,23 +1336,72 @@ class AgentPanel extends Widget {
       return `<div class="${cls}">${label}</div>`;
     }).join('');
 
+    const fbStyle = this._continueFeedbackMode ? '' : 'display:none;';
+    const hint = this._continueFeedbackMode
+      ? 'Enter send · Esc back to options'
+      : '↑↓ select · Enter confirm · Esc cancel';
+
     this._confirmWrapper.innerHTML = `
       <div class="skillbot-confirm-label">${this._esc(summary)}</div>
       ${optionsHtml}
-      <div class="skillbot-confirm-hint">↑↓ select · Enter confirm · Esc cancel</div>
+      <textarea class="skillbot-confirm-feedback" style="${fbStyle}"
+                placeholder="Answer the agent (e.g. the file path), then press Enter..."></textarea>
+      <div class="skillbot-confirm-hint">${hint}</div>
     `;
+
+    if (saved) {
+      const newTa = this._confirmWrapper.querySelector('.skillbot-confirm-feedback') as HTMLTextAreaElement;
+      if (newTa) newTa.value = saved;
+    }
+    if (this._continueFeedbackMode) {
+      const ta = this._confirmWrapper.querySelector('.skillbot-confirm-feedback') as HTMLTextAreaElement;
+      if (ta) ta.focus();
+    }
   }
 
   private _submitContinue(): void {
+    // Feedback mode: send the typed answer back to the agent as prose.
+    if (this._continueFeedbackMode) {
+      const ta = this._confirmWrapper.querySelector('.skillbot-confirm-feedback') as HTMLTextAreaElement;
+      const answer = ta ? ta.value.trim() : '';
+      if (!answer) { this._continueFeedbackMode = false; this._renderContinueOptions(); this._confirmWrapper.focus(); return; }
+      this._continueConfirmActive = false;
+      this._continueFeedbackMode = false;
+      this._confirmWrapper.style.display = 'none';
+      this._confirmWrapper.innerHTML = '';
+      this._inputWrapper.style.display = '';
+      this._sendContinueCmd(`/continue ${answer}`);
+      return;
+    }
+    // Option 2 ("Type an answer instead") opens the textarea rather than submitting.
+    if (this._continueOptionIdx === 2) {
+      this._continueFeedbackMode = true;
+      this._renderContinueOptions();
+      return;
+    }
     const arg = this._continueOptionIdx === 0 ? 'yes' : 'no';
     this._continueConfirmActive = false;
     this._confirmWrapper.style.display = 'none';
     this._confirmWrapper.innerHTML = '';
     this._inputWrapper.style.display = '';
     this._inputEl.focus();
+    this._sendContinueCmd(`/continue ${arg}`);
+  }
+
+  /** Send a /continue command; a free-text answer also shows a spinner since
+   *  the agent will stream a fresh response. */
+  private _sendContinueCmd(cmd: string): void {
+    const isAnswer = !/^\/continue (yes|no)$/.test(cmd);
+    if (isAnswer) {
+      this._startBlock();
+      this._startSpinner();
+      this._setStatus('…', 'thinking');
+    } else {
+      this._inputEl.focus();
+    }
     if (this._kernel) {
       this._kernel.requestExecute({
-        code: `get_ipython().user_ns['_panel_input']('/continue ${arg}')`,
+        code: `get_ipython().user_ns['_panel_input'](${JSON.stringify(cmd)})`,
         store_history: false,
       });
     }
@@ -1507,14 +1417,6 @@ class AgentPanel extends Widget {
     return s.replace(/\x1b\[[0-9;]*m/g, '');
   }
 
-  private _ansiToHtml(s: string): string {
-    return s.replace(/\x1b\[32m/g, '<span style="color:#4ade80">')
-            .replace(/\x1b\[31m/g, '<span style="color:#f87171">')
-            .replace(/\x1b\[90m/g, '<span style="color:#999">')
-            .replace(/\x1b\[0m/g, '</span>')
-            .replace(/\x1b\[[0-9;]*m/g, '');
-  }
-
   private _esc(s: string): string {
     const d = document.createElement('div');
     d.textContent = s;
@@ -1523,6 +1425,27 @@ class AgentPanel extends Widget {
 
   setTracker(tracker: INotebookTracker): void {
     this._tracker = tracker;
+  }
+
+  /** Re-run exactly the given cell ids, in order — the precise dependency slice. */
+  private _runCellsByIds(notebook: any, sessionContext: any, ids: string[]): void {
+    const model = notebook.model;
+    if (!model) return;
+    const cells = model.sharedModel.cells;
+    const posById: Record<string, number> = {};
+    for (let i = 0; i < cells.length; i++) posById[cells[i].id] = i;
+    // Select the target cells (deselecting everything else), then run the selection.
+    // NotebookActions.run executes the active cell plus all selected cells in
+    // document order, which matches the ordered slice we were given.
+    const positions = ids.map(id => posById[id]).filter(p => p !== undefined);
+    if (!positions.length) return;
+    positions.sort((a, b) => a - b);
+    notebook.activeCellIndex = positions[0];
+    notebook.deselectAll();
+    for (const p of positions) {
+      notebook.select(notebook.widgets[p]);
+    }
+    NotebookActions.run(notebook, sessionContext);
   }
 
   _handleCellComm(comm: any, msg: any): void {
@@ -1544,6 +1467,13 @@ class AgentPanel extends Widget {
     const auto: boolean = data.auto !== false;
     const cellType: string = data.cell_type || 'code';
     const replaceId: string = data.replace_cell_id || '';
+    // run_below: re-run this cell AND every cell below it (step revise → recompute
+    // the downstream chain). Implies execution regardless of the `auto` flag.
+    const runBelow: boolean = data.run_below === true;
+    // run_cell_ids: precise dependency slice — re-run exactly these cells, in order
+    // (the changed cell followed by only its true downstream dependents). Takes
+    // precedence over runBelow when non-empty.
+    const runCellIds: string[] = Array.isArray(data.run_cell_ids) ? data.run_cell_ids : [];
     if (!code) return;
 
     const notebook = nb.content;
@@ -1555,8 +1485,11 @@ class AgentPanel extends Widget {
           cells[i].source = code;
           notebook.activeCellIndex = i;
           comm.send({ cell_id: cells[i].id });
-          if (cellType !== 'markdown' && auto) {
-            NotebookActions.run(notebook, nb.context.sessionContext);
+          this._persistNotebook();  // flush the edit to disk (survives refresh)
+          if (cellType !== 'markdown' && (auto || runBelow || runCellIds.length)) {
+            if (runCellIds.length) this._runCellsByIds(notebook, nb.context.sessionContext, runCellIds);
+            else if (runBelow) NotebookActions.runAllBelow(notebook, nb.context.sessionContext);
+            else NotebookActions.run(notebook, nb.context.sessionContext);
           }
           return;
         }
@@ -1574,12 +1507,32 @@ class AgentPanel extends Widget {
     notebook.activeCellIndex = activeIndex + 1;
 
     comm.send({ cell_id: newCell.id });
+    this._persistNotebook();  // flush the new cell to disk (survives refresh)
 
-    if (cellType === 'markdown' || !auto) return;
-    NotebookActions.run(notebook, nb.context.sessionContext);
+    if (cellType === 'markdown' || (!auto && !runBelow)) return;
+    if (runBelow) NotebookActions.runAllBelow(notebook, nb.context.sessionContext);
+    else NotebookActions.run(notebook, nb.context.sessionContext);
   }
 
   // ---- kernel / comm -------------------------------------------------------
+
+  /**
+   * Persist the active notebook document to disk. Agent-generated cells are
+   * inserted into the in-memory notebook model only, which marks the document
+   * dirty but does NOT write it out. Without this, a browser refresh reloads
+   * the last-saved (often empty) file and the generated cells vanish. Debounced
+   * so a burst of cell edits collapses into a single save.
+   */
+  private _persistNotebook(): void {
+    const nb = this._tracker?.currentWidget;
+    const ctx = nb?.context as any;
+    if (!ctx?.save) return;
+    if (this._persistTimer) clearTimeout(this._persistTimer);
+    this._persistTimer = setTimeout(() => {
+      this._persistTimer = null;
+      try { ctx.save(); } catch (e) { console.error('[panel] notebook save failed:', e); }
+    }, 400);
+  }
 
   resetComm(): void {
     if (this._comm) {
@@ -1623,13 +1576,20 @@ class AgentPanel extends Widget {
         switch (d.action) {
           case 'text':
             if (this._skillsMode) {
-              const txt = this._ansiToHtml(d.content || '');
-              if (txt.includes('✗')) this._installError = txt.trim();
+              // Surface backend upload/uninstall feedback inline in the list.
+              this._showSkillNotice(this._stripAnsi(d.content || '').trim());
             } else {
-              const txt = this._ansiToHtml(d.content || '');
-              this._appendTextChunk(txt);
+              // Pass RAW text — the renderer parses markdown + ANSI itself.
+              const raw = d.content || '';
+              // Plan mode: stream prose straight into the plan card (single
+              // source of truth) instead of a standalone text block that would
+              // later be duplicated by the plan card. Non-plan turns unchanged.
+              if (this._mode === 'plan') {
+                this._planStreamTarget();
+              }
+              this._appendTextChunk(raw);
               // Backend sent config confirmation → enable y/n
-              if (txt.includes('Press y to apply')) {
+              if (raw.includes('Press y to apply')) {
                 this._configPending = true;
                 this._infoEl.innerHTML = '<span style=\"color:rgb(0,180,180)\">Press y to apply  n to cancel</span>';
                 if (this._infoTimer) clearTimeout(this._infoTimer);
@@ -1650,15 +1610,22 @@ class AgentPanel extends Widget {
             this._streaming = false;
             this._responseStarted = false;
             this._setStatus('⏸', 'plan');
-            this._renderPlanBlock(d.summary || '');
+            // Reuse the card the prose already streamed into (plan mode); only
+            // falls back to a fresh card when nothing streamed. Avoids the old
+            // duplicate where text showed once plain + once in the card.
+            this._finalizePlanBlock(d.summary || '');
             this._renderPlanConfirm(d.summary || '');
             this._saveState();
             break;
           case 'skill_list':
             if (!this._skillsMode) this._enterSkillsMode();
-            this._installMode = false;
-            this._installError = '';
             this._renderSkillList(d.skills || []);
+            break;
+          case 'step_timeline':
+            // Keep the model current even when the view is closed, so opening
+            // Steps later shows the latest state without a round-trip.
+            this._stepData = d.steps || [];
+            if (this._stepsMode) this._renderStepList(this._stepData);
             break;
           case 'continue_confirm':
             this._stopSpinner();
@@ -1670,11 +1637,37 @@ class AgentPanel extends Widget {
             this._stopSpinner();
             this._busy = false;
             this._dequeueNext();
+            this._syncActionBar();
             break;
           case 'clear':       this._clear(); break;
+          case 'restore_conversation':
+            // Disk copy arrived for a path with no localStorage cache.
+            if ((d.path || '') === this._currentPath && d.buffer) {
+              this._applyBuffer(d.buffer);
+              try { localStorage.setItem(this._storageKey(this._currentPath), d.buffer); } catch (_) {}
+            }
+            break;
+          case 'conversation_list':
+            // Merge disk-persisted sessions into the switcher registry.
+            if (Array.isArray(d.sessions)) {
+              const reg = this._loadRegistry();
+              for (const s of d.sessions) {
+                if (s.path) reg[s.path] = s.path.split('/').pop() || s.path;
+              }
+              this._saveRegistry(reg);
+              this._renderSessionBar();
+            }
+            break;
         }
       };
       this._comm.open();
+      // Pull disk-persisted sessions into the switcher (covers fresh browsers).
+      try {
+        this._kernel.requestExecute({
+          code: `get_ipython().user_ns['_panel_list_conversations']()`,
+          store_history: false,
+        });
+      } catch (_) {}
     } catch (e) {
       console.error('[panel] createComm failed:', e);
     }
@@ -1894,6 +1887,7 @@ export const panelPlugin: JupyterFrontEndPlugin<void> = {
   activate: (_app: JupyterFrontEnd, tracker: INotebookTracker) => {
     const panel = new AgentPanel();
     panel.setTracker(tracker);
+    panel.setApp(_app);
     _app.shell.add(panel, 'right', { rank: 100 });
     _panelInstance = panel;
     let _panelOpened = false;
@@ -1914,6 +1908,10 @@ export const panelPlugin: JupyterFrontEndPlugin<void> = {
       const ctx = nb.context.sessionContext;
       if (!ctx) return;
 
+      // Swap the panel's conversation buffer to match the active notebook.
+      // This is what makes each notebook its own session.
+      const pathChanged = panel.setActivePath(nb.context.path || '');
+
       // wire kernel restart handler when context changes
       if (ctx !== _currentCtx) {
         if (_currentCtx) _currentCtx.kernelChanged.disconnect(onKernelChanged);
@@ -1932,6 +1930,9 @@ export const panelPlugin: JupyterFrontEndPlugin<void> = {
           console.error('[panel] registerCommTarget failed:', e);
         }
         panel.connectKernel(kernel);
+        // Now that the target notebook's kernel is connected, tell the backend
+        // to start a fresh agent conversation for it (only on a real switch).
+        if (pathChanged) panel.notifyNotebookSwitch(nb.context.path || '');
       }
 
       // Wire cell deletion tracking (disconnect old on notebook change)
@@ -1975,6 +1976,21 @@ export const panelPlugin: JupyterFrontEndPlugin<void> = {
         const code = cell.model.sharedModel.getSource();
         if (!code.trim()) { alert('Cell is empty.'); return; }
 
+        let selectionStart = 0, selectionEnd = 0, selectedText = '';
+        try {
+          const editor = (cell as any).editor;
+          if (editor && editor.selection) {
+            const sel = editor.selection;
+            if (sel.start && sel.end) {
+              selectionStart = sel.start.offset;
+              selectionEnd = sel.end.offset;
+              if (selectionStart !== selectionEnd) {
+                selectedText = code.substring(selectionStart, selectionEnd);
+              }
+            }
+          }
+        } catch (_) {}
+
         let output = '';
         let cellError = '';
         try {
@@ -1990,7 +2006,7 @@ export const panelPlugin: JupyterFrontEndPlugin<void> = {
         } catch (_) {}
 
         const input = document.createElement('textarea');
-        input.placeholder = 'e.g. optimize query, fix bug, improve readability...';
+        input.placeholder = selectedText ? 'e.g. optimize this selected code, fix bug...' : 'e.g. optimize query, fix bug, improve readability...';
         input.style.cssText = 'width:100%;min-height:60px;background:#111;color:#ddd;border:1px solid #444;padding:8px;font-size:12px;resize:vertical;font-family:inherit;';
 
         const hint = document.createElement('div');
@@ -2001,10 +2017,9 @@ export const panelPlugin: JupyterFrontEndPlugin<void> = {
         body.node.appendChild(input);
         body.node.appendChild(hint);
 
-        // Build dialog manually for keyboard control
         let autoRun = false;
         const dialog = new Dialog({
-          title: 'Cell Optimization',
+          title: selectedText ? 'Optimize Selected Code' : 'Cell Optimization',
           body,
           buttons: [
             Dialog.cancelButton(),
@@ -2012,7 +2027,6 @@ export const panelPlugin: JupyterFrontEndPlugin<void> = {
             Dialog.okButton({ label: 'Optimize' }),
           ],
         });
-        // After render, hijack the dialog's keyboard handling
         dialog.node.addEventListener('keydown', (e: KeyboardEvent) => {
           if (e.key !== 'Enter' || e.isComposing) return;
           if (document.activeElement?.tagName === 'TEXTAREA') {
@@ -2031,7 +2045,7 @@ export const panelPlugin: JupyterFrontEndPlugin<void> = {
 
         const clicked = dlgResult.button.label;
         if (clicked === 'Cancel') return;
-        const userRequest = input.value.trim() || 'improve this code';
+        const userRequest = input.value.trim() || (selectedText ? 'improve this selected code' : 'improve this code');
         const autoExec = autoRun || clicked === 'Optimize & Run';
 
         const payloadJson = JSON.stringify({
@@ -2040,6 +2054,7 @@ export const panelPlugin: JupyterFrontEndPlugin<void> = {
           cellType,
           request: userRequest,
           auto: autoExec,
+          selection: selectedText ? { start: selectionStart, end: selectionEnd, text: selectedText } : null,
         });
         panel._kernel.requestExecute({
           code: `get_ipython().user_ns['_panel_input']('/cell-optimize ' + ${JSON.stringify(payloadJson)})`,
@@ -2129,5 +2144,19 @@ export const panelPlugin: JupyterFrontEndPlugin<void> = {
 
     tracker.currentChanged.connect(() => register());
     setTimeout(register, 500);
+
+    // When a notebook file is deleted from the file browser, purge its
+    // conversation record so stale sessions don't linger in the switcher.
+    try {
+      const contents = (_app.serviceManager as any)?.contents;
+      contents?.fileChanged?.connect((_sender: any, change: any) => {
+        if (change?.type === 'delete') {
+          const p = change.oldValue?.path || '';
+          if (p && /\.ipynb$/.test(p)) panel.onNotebookFileDeleted(p);
+        }
+      });
+    } catch (e) {
+      console.error('[panel] fileChanged wiring failed:', e);
+    }
   },
 };

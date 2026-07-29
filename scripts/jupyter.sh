@@ -18,12 +18,14 @@ Start Jupyter with %%agent / %%sql magic pre-loaded.
 
 Options:
   --remote        bind to 0.0.0.0 (all interfaces) for remote access
+  --no-agent      skip auto-starting the agent backend gateway
 
 Examples:
   jupyter.sh                          # start notebook on localhost:8888
   jupyter.sh lab --remote             # JupyterLab, bind to all interfaces
   jupyter.sh notebook --port 9999     # custom port
   jupyter.sh lab --no-browser         # headless
+  jupyter.sh lab --no-agent           # don't auto-start hermes gateway
 EOF
     exit 0
 }
@@ -92,7 +94,7 @@ BOOTSTRAP_EOF
                     sed -i '' "s/return filename.split('=')\[1\].trim()/var parts = filename.split('=')\n            return parts.length > 1 ? parts[1].trim() : null/" "$_f"
                 fi
             done
-            PATH="${PROJECT_DIR}/.venv/bin:${HOME}/.npm-global/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" \
+            PATH="$(dirname "$(command -v node)"):${PROJECT_DIR}/.venv/bin:${HOME}/.npm-global/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" \
                 "${VENV_PYTHON}" -m jupyter labextension build . 2>&1 | tail -1
             # Copy built extension to JupyterLab's shared directory
             rm -rf "${PROJECT_DIR}/.venv/share/jupyter/labextensions/skillbot-jupyter"
@@ -151,7 +153,7 @@ _rebuild() {
             sed -i '' "s/return filename.split('=')\[1\].trim()/var parts = filename.split('=')\n            return parts.length > 1 ? parts[1].trim() : null/" "$_f"
         fi
     done
-    PATH="${PROJECT_DIR}/.venv/bin:${HOME}/.npm-global/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" \
+    PATH="$(dirname "$(command -v node)"):${PROJECT_DIR}/.venv/bin:${HOME}/.npm-global/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" \
         "${VENV_PYTHON}" -m jupyter labextension build .
     echo "  [3/3] sync to labextensions..."
     rm -rf "${ext_install_dir}"
@@ -161,14 +163,77 @@ _rebuild() {
 }
 
 # -----------------------------------------------------------
+# agent backend: auto-start the gateway the %%agent magic talks to
+# (e.g. hermes-agent REST gateway on :8642). Idempotent — run.sh
+# skips if already running. Never aborts Jupyter startup on failure.
+# -----------------------------------------------------------
+
+# Read the configured agent name from conf/jupyter_agent.yaml (default hermes-agent)
+_configured_agent() {
+    local conf="${PROJECT_DIR}/conf/jupyter_agent.yaml"
+    local agent="hermes-agent"
+    if [[ -f "$conf" ]]; then
+        local parsed
+        parsed=$(grep -E '^[[:space:]]*agent:' "$conf" 2>/dev/null | head -1 \
+            | sed 's/^[[:space:]]*agent:[[:space:]]*//; s/[[:space:]]*#.*//; s/[[:space:]]*$//')
+        [[ -n "$parsed" ]] && agent="$parsed"
+    fi
+    echo "$agent"
+}
+
+# Health-check port for agents whose backend the chat client connects to
+_agent_health_port() {
+    case "$1" in
+        hermes-agent) echo "8642" ;;
+        *)            echo "" ;;
+    esac
+}
+
+_ensure_agent_backend() {
+    local run_sh="${PROJECT_DIR}/scripts/run.sh"
+    [[ -f "$run_sh" ]] || return 0
+
+    local agent
+    agent="$(_configured_agent)"
+    echo "=== Ensuring ${agent} backend ==="
+
+    # Delegate to run.sh (idempotent: skips if already running). Guard against
+    # set -e so a backend failure never blocks Jupyter from starting.
+    bash "$run_sh" start "$agent" --no-webui 2>&1 | sed 's/^/  /' || \
+        echo "  [WARN] backend start returned non-zero — check .run/${agent}.log"
+
+    # Wait for the REST gateway health endpoint (only for agents we know the port of)
+    local port
+    port="$(_agent_health_port "$agent")"
+    if [[ -n "$port" ]]; then
+        local i
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -s -o /dev/null "http://127.0.0.1:${port}/health" 2>/dev/null; then
+                echo "  [OK] ${agent} gateway ready on :${port}"
+                return 0
+            fi
+            sleep 2
+        done
+        echo "  [WARN] ${agent} gateway not ready on :${port} after 20s — first message may fail"
+    fi
+}
+
+# -----------------------------------------------------------
 # start
 # -----------------------------------------------------------
 _start() {
     local mode="${1:-notebook}"
     local remote="${2:-0}"
-    shift 2 || shift || true
+    local no_agent="${3:-0}"
+    shift 3 || shift 2 || shift || true
 
     _setup
+
+    if [[ "$no_agent" != "1" ]]; then
+        _ensure_agent_backend
+    else
+        echo "  [SKIP] agent backend auto-start disabled (--no-agent)"
+    fi
 
     echo "=== Starting Jupyter ${mode} ==="
     echo "  PYTHONPATH: ${SRC}"
@@ -176,6 +241,33 @@ _start() {
 
     export PYTHONPATH="${SRC}${PYTHONPATH:+:${PYTHONPATH}}"
     export IPYTHONDIR="${IPYTHON_PROFILE}"
+    # keep jupyter's config/data/runtime inside the project (sandbox blocks ~/Library/Jupyter)
+    export JUPYTER_CONFIG_DIR="${IPYTHON_PROFILE}/jupyter_config"
+    export JUPYTER_DATA_DIR="${IPYTHON_PROFILE}/jupyter_data"
+    export JUPYTER_RUNTIME_DIR="${IPYTHON_PROFILE}/jupyter_runtime"
+    mkdir -p "${JUPYTER_CONFIG_DIR}" "${JUPYTER_DATA_DIR}" "${JUPYTER_RUNTIME_DIR}"
+
+    # ---- multi-instance guardrail attribution ----
+    # Each server on its own port is a distinct "instance"; kernels inherit these
+    # env vars, so guardrail hits are logged to .run/guardrail/<instance>.jsonl
+    # with the owning user attached. Lets one repo checkout serve many users on
+    # different ports while keeping per-user violation logs separate + queryable
+    # (see src/jupyter/guardrail_log.py, `/violations all`).
+    local _port=""
+    local _prev=""
+    for _a in "$@"; do
+        case "$_a" in
+            --port=*) _port="${_a#--port=}" ;;
+            --port)   _prev="port" ;;
+            *)        [[ "$_prev" == "port" ]] && _port="$_a"; _prev="" ;;
+        esac
+    done
+    [[ -n "$_port" ]] && export SKILLBOT_PORT="$_port"
+    : "${SKILLBOT_INSTANCE:=${SKILLBOT_PORT:+port-${SKILLBOT_PORT}}}"
+    export SKILLBOT_INSTANCE="${SKILLBOT_INSTANCE:-default}"
+    export SKILLBOT_USER="${SKILLBOT_USER:-$(id -un)}"
+    echo "  guardrail instance: ${SKILLBOT_INSTANCE} (user: ${SKILLBOT_USER})"
+
     # ensure venv takes priority over system anaconda
     export PATH="${PROJECT_DIR}/.venv/bin:${PATH}"
     cd "${IPYTHON_PROFILE}/run"
@@ -193,7 +285,7 @@ _start() {
     fi
 
     case "$mode" in
-        lab)      exec "${VENV_PYTHON}" -m jupyterlab "$@" ;;
+        lab)      exec "${VENV_PYTHON}" -m jupyterlab --default-kernel=skillbot "$@" ;;
         notebook) exec "${VENV_PYTHON}" -m notebook "$@" ;;
     esac
 }
@@ -213,23 +305,26 @@ main() {
 
     local mode="notebook"
     local remote=0
+    local no_agent=0
     if [[ $# -gt 0 ]]; then
         case "$1" in
             lab|notebook) mode="$1"; shift ;;
         esac
     fi
 
-    # extract --remote flag (don't pass it to Jupyter)
+    # extract our own flags (don't pass them to Jupyter)
     local passthru=()
     for _a in "$@"; do
         if [[ "$_a" == "--remote" ]]; then
             remote=1
+        elif [[ "$_a" == "--no-agent" ]]; then
+            no_agent=1
         else
             passthru+=("$_a")
         fi
     done
 
-    _start "$mode" "$remote" ${passthru:+"${passthru[@]}"}
+    _start "$mode" "$remote" "$no_agent" ${passthru:+"${passthru[@]}"}
 }
 
 main "$@"

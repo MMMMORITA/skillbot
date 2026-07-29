@@ -83,23 +83,23 @@ class AgentSession:
     # -- streaming --
 
     def stream(self, prompt: str, timeout: int | None = None,
-               show_text: bool = True, on_chunk=None, on_thinking=None) -> str:
+               show_text: bool = True, on_chunk=None, on_thinking=None,
+               on_tool_use=None) -> str:
         if self._client:
             prompt = self._client._maybe_inject_skills(prompt)
-        return self._stream(self._client, prompt, self._session_id, timeout, show_text, on_chunk, on_thinking)
+        return self._stream(self._client, prompt, self._session_id, timeout, show_text, on_chunk, on_thinking, on_tool_use)
 
     @staticmethod
     def _stream(
         client, prompt: str, session: str,
         timeout: int | None = None, show_text: bool = True,
-        on_chunk=None, on_thinking=None,
+        on_chunk=None, on_thinking=None, on_tool_use=None,
     ) -> str:
         if timeout is not None and client is not None:
             client._backend._timeout = timeout
 
         raw = ""
         thinking_lines: list[str] = []
-        tool_names: set[str] = set()
         t0 = time.time()
 
         gen = client._backend.stream_chunks(prompt, session=session)
@@ -120,8 +120,8 @@ class AgentSession:
                             name = b.data.get("name", "?")
                             tool_input = b.data.get("input", {}) or {}
                             detail = _format_tool_detail(name, tool_input, b.data)
-                            if name not in tool_names:
-                                tool_names.add(name)
+                            if on_tool_use:
+                                on_tool_use(name)
                             _log.debug("tool_use: %s %s", name, tool_input)
                             if on_chunk:
                                 on_chunk(f"\n\033[32m⏺ {name}\033[0m\033[90m({detail})\033[0m\n")
@@ -175,8 +175,8 @@ class AgentSession:
             print(f"\033[90m# thinking: {summary}\033[0m")
         print()
 
-        _log.info("agent stream: session=%s elapsed=%.1fs output=%d chars tools=%d",
-                  session, elapsed, len(raw), len(tool_names))
+        _log.info("agent stream: session=%s elapsed=%.1fs output=%d chars",
+                  session, elapsed, len(raw))
         _log.debug("agent output:\n%s", raw[:5000])
         return raw
 

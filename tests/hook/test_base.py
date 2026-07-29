@@ -123,8 +123,8 @@ class TestRegistry:
 
         g = HookGroup("test")
         g.add(B()); g.add(A())
-        HookRegistry.register_group(g, HookEvent.AGENT_CELL_REVIEW)
-        HookRegistry.dispatch(HookEvent.AGENT_CELL_REVIEW, {})
+        HookRegistry.register_group(g, HookEvent.CODE_REVIEW)
+        HookRegistry.dispatch(HookEvent.CODE_REVIEW, {})
         assert order == [1, 2]
 
     def test_dispatch_stops_on_failed_stop(self):
@@ -142,8 +142,8 @@ class TestRegistry:
 
         g = HookGroup("test")
         g.add(Stopper()); g.add(Never())
-        HookRegistry.register_group(g, HookEvent.AGENT_CELL_REVIEW)
-        r = HookRegistry.dispatch(HookEvent.AGENT_CELL_REVIEW, {})
+        HookRegistry.register_group(g, HookEvent.CODE_REVIEW)
+        r = HookRegistry.dispatch(HookEvent.CODE_REVIEW, {})
         assert r.status == HookStatus.FAILED_STOP
         assert called == ["stopper"]
 
@@ -162,8 +162,8 @@ class TestRegistry:
 
         g = HookGroup("test")
         g.add(Failer()); g.add(Next())
-        HookRegistry.register_group(g, HookEvent.AGENT_CELL_REVIEW)
-        r = HookRegistry.dispatch(HookEvent.AGENT_CELL_REVIEW, {})
+        HookRegistry.register_group(g, HookEvent.CODE_REVIEW)
+        r = HookRegistry.dispatch(HookEvent.CODE_REVIEW, {})
         assert r.status == HookStatus.SUCCESS
         assert called == ["failer", "next"]
 
