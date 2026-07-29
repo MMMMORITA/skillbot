@@ -101,6 +101,8 @@ class AgentPanel extends widgets_1.Widget {
         this._responseStarted = false;
         this._textEl = null; // accumulated text element for streaming
         this._thinkingEl = null; // accumulated thinking element
+        this._planEl = null; // plan card wrapper (streaming plan mode)
+        this._planBodyEl = null; // plan card body the prose streams into
         this._thinkingCollapsed = true; // Ctrl+T to toggle collapse
         this._busy = false; // agent is working → queue new prompts
         this._promptQueue = [];
@@ -1086,6 +1088,8 @@ class AgentPanel extends widgets_1.Widget {
         this._responseStarted = false;
         this._textEl = null;
         this._thinkingEl = null;
+        this._planEl = null;
+        this._planBodyEl = null;
     }
     _appendToBlock(el) {
         const target = this._currentBlock || this._outputEl;
@@ -1100,7 +1104,8 @@ class AgentPanel extends widgets_1.Widget {
     _renderTool(name) { R.renderTool(this, name); }
     _renderThinking(content) { R.renderThinking(this, content); }
     _renderCodeBlock(l, c) { R.renderCodeBlock(this, l, c); }
-    _renderPlanBlock(text) { R.renderPlanBlock(this, text); }
+    _planStreamTarget() { R.planStreamTarget(this); }
+    _finalizePlanBlock(text) { R.finalizePlanBlock(this, text); }
     _renderResult(summary) { R.renderResult(this, summary); }
     // ---- skills view (impl in panelSkills.ts) -------------------------------
     _enterSkillsMode() { SK.enterSkillsMode(this); }
@@ -1692,6 +1697,12 @@ class AgentPanel extends widgets_1.Widget {
                         else {
                             // Pass RAW text — the renderer parses markdown + ANSI itself.
                             const raw = d.content || '';
+                            // Plan mode: stream prose straight into the plan card (single
+                            // source of truth) instead of a standalone text block that would
+                            // later be duplicated by the plan card. Non-plan turns unchanged.
+                            if (this._mode === 'plan') {
+                                this._planStreamTarget();
+                            }
                             this._appendTextChunk(raw);
                             // Backend sent config confirmation → enable y/n
                             if (raw.includes('Press y to apply')) {
@@ -1724,7 +1735,10 @@ class AgentPanel extends widgets_1.Widget {
                         this._streaming = false;
                         this._responseStarted = false;
                         this._setStatus('⏸', 'plan');
-                        this._renderPlanBlock(d.summary || '');
+                        // Reuse the card the prose already streamed into (plan mode); only
+                        // falls back to a fresh card when nothing streamed. Avoids the old
+                        // duplicate where text showed once plain + once in the card.
+                        this._finalizePlanBlock(d.summary || '');
                         this._renderPlanConfirm(d.summary || '');
                         this._saveState();
                         break;

@@ -8,6 +8,8 @@ exports.renderTool = renderTool;
 exports.renderThinking = renderThinking;
 exports.renderCodeBlock = renderCodeBlock;
 exports.renderPlanBlock = renderPlanBlock;
+exports.planStreamTarget = planStreamTarget;
+exports.finalizePlanBlock = finalizePlanBlock;
 exports.renderResult = renderResult;
 // Output rendering helpers for AgentPanel
 // All functions take the panel instance (as any to avoid circular imports)
@@ -129,6 +131,50 @@ function renderPlanBlock(panel, text) {
     wrapper.className = 'skillbot-plan-block';
     wrapper.innerHTML = `<div class="skillbot-plan-header">⏸ Plan</div>${panel._esc(text)}`;
     panel._appendToBlock(wrapper);
+}
+// Streaming plan: in plan mode the prose is the plan itself, so stream it
+// straight INTO the plan card instead of rendering plain text first and a
+// duplicate card afterwards. Lazily creates the card on the first chunk and
+// returns its body element; appendTextChunk then accumulates markdown into it
+// exactly like a normal text element (panel._textEl points at the body).
+function planStreamTarget(panel) {
+    if (!panel._planEl || !panel._planEl.parentElement) {
+        ensureResponsePrefix(panel);
+        panel._textEl = null;
+        panel._thinkingEl = null;
+        const wrapper = document.createElement('div');
+        wrapper.className = 'skillbot-plan-block';
+        const header = document.createElement('div');
+        header.className = 'skillbot-plan-header';
+        header.textContent = '⏸ Plan';
+        const body = document.createElement('div');
+        body.className = 'skillbot-response-text skillbot-markdown';
+        wrapper.appendChild(header);
+        wrapper.appendChild(body);
+        panel._appendToBlock(wrapper);
+        panel._planEl = wrapper;
+        panel._planBodyEl = body;
+    }
+    // Point the streaming accumulator at the card body so appendTextChunk's
+    // markdown re-render logic fills the card instead of a standalone text block.
+    panel._textEl = panel._planBodyEl;
+    return panel._planBodyEl;
+}
+// Called when the plan_confirm signal arrives. If text already streamed into a
+// card, reconcile its final content and drop the reference (no second card).
+// If nothing streamed (e.g. structured plan with empty prose), fall back to the
+// classic one-shot card so the summary is never lost.
+function finalizePlanBlock(panel, text) {
+    if (panel._planEl && panel._planEl.parentElement) {
+        if (text && !(panel._planBodyEl && panel._planBodyEl._raw)) {
+            panel._planBodyEl.innerHTML = renderMarkdown(panel, text);
+        }
+        panel._planEl = null;
+        panel._planBodyEl = null;
+        panel._textEl = null;
+        return;
+    }
+    renderPlanBlock(panel, text);
 }
 function renderResult(panel, summary) {
     ensureResponsePrefix(panel);

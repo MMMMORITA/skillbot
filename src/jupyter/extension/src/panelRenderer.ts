@@ -122,6 +122,49 @@ export function renderPlanBlock(panel: any, text: string): void {
   panel._appendToBlock(wrapper);
 }
 
+// Streaming plan: in plan mode the prose is the plan itself, so stream it
+// straight INTO the plan card instead of rendering plain text first and a
+// duplicate card afterwards. Lazily creates the card on the first chunk and
+// returns its body element; appendTextChunk then accumulates markdown into it
+// exactly like a normal text element (panel._textEl points at the body).
+export function planStreamTarget(panel: any): HTMLElement {
+  if (!panel._planEl || !panel._planEl.parentElement) {
+    ensureResponsePrefix(panel);
+    panel._textEl = null; panel._thinkingEl = null;
+    const wrapper = document.createElement('div');
+    wrapper.className = 'skillbot-plan-block';
+    const header = document.createElement('div');
+    header.className = 'skillbot-plan-header';
+    header.textContent = '⏸ Plan';
+    const body = document.createElement('div');
+    body.className = 'skillbot-response-text skillbot-markdown';
+    wrapper.appendChild(header);
+    wrapper.appendChild(body);
+    panel._appendToBlock(wrapper);
+    panel._planEl = wrapper;
+    panel._planBodyEl = body;
+  }
+  // Point the streaming accumulator at the card body so appendTextChunk's
+  // markdown re-render logic fills the card instead of a standalone text block.
+  panel._textEl = panel._planBodyEl;
+  return panel._planBodyEl;
+}
+
+// Called when the plan_confirm signal arrives. If text already streamed into a
+// card, reconcile its final content and drop the reference (no second card).
+// If nothing streamed (e.g. structured plan with empty prose), fall back to the
+// classic one-shot card so the summary is never lost.
+export function finalizePlanBlock(panel: any, text: string): void {
+  if (panel._planEl && panel._planEl.parentElement) {
+    if (text && !(panel._planBodyEl && panel._planBodyEl._raw)) {
+      panel._planBodyEl.innerHTML = renderMarkdown(panel, text);
+    }
+    panel._planEl = null; panel._planBodyEl = null; panel._textEl = null;
+    return;
+  }
+  renderPlanBlock(panel, text);
+}
+
 export function renderResult(panel: any, summary: string): void {
   ensureResponsePrefix(panel);
   panel._textEl = null; panel._thinkingEl = null;
