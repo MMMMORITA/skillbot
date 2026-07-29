@@ -316,8 +316,15 @@ class AgentMagic(Magics):
         send_to_panel(self.ns, "result", summary="")
         send_to_panel(self.ns, "ready")
 
-    def _stream_with_interrupt(self, prompt: str) -> tuple[str, bool]:
-        """Stream agent response. Returns (raw_text, was_interrupted)."""
+    def _stream_with_interrupt(self, prompt: str, silent: bool = False) -> tuple[str, bool]:
+        """Stream agent response. Returns (raw_text, was_interrupted).
+
+        ``silent=True`` runs the model without surfacing anything to the panel —
+        used for internal round-trips (e.g. the decision-gate rescue) whose raw
+        output is machine-parsed, not shown. Without this the rescue's prose was
+        streamed to the panel on top of the original reply, so the user saw the
+        answer twice (three times once the plan card was added).
+        """
         if self._session_dirty:
             self._session_dirty = False
             prompt = _INTERRUPT_NOTE + "\n\n" + prompt
@@ -327,7 +334,8 @@ class AgentMagic(Magics):
         tool_names: set[str] = set()
 
         def _on_chunk(t):
-            send_to_panel(self.ns, "text", content=t)
+            if not silent:
+                send_to_panel(self.ns, "text", content=t)
 
         _think_buf = ""
         _think_last = 0.0
@@ -338,7 +346,8 @@ class AgentMagic(Magics):
             _think_buf += t
             now = time.time()
             if now - _think_last >= 0.2:
-                send_thinking(_think_buf)
+                if not silent:
+                    send_thinking(_think_buf)
                 _think_buf = ""
                 _think_last = now
 
@@ -350,11 +359,15 @@ class AgentMagic(Magics):
                 on_chunk=_on_chunk,
                 on_thinking=_on_thinking,
                 on_tool_use=_on_tool_use)
-            if _think_buf:
+            if _think_buf and not silent:
                 send_thinking(_think_buf)
-            send_to_panel(self.ns, "text", content="\n")
+            if not silent:
+                send_to_panel(self.ns, "text", content="\n")
             elapsed_ms = int((time.time() - t0) * 1000)
-            if rec:
+            # Silent runs are internal round-trips (rescue), not real turns —
+            # recording them as agent_response pollutes telemetry with a phantom
+            # extra response for one prompt.
+            if rec and not silent:
                 code_blocks = raw.count("```") // 2 if raw.strip() else 0
                 rec.record("agent_response",
                     mode=getattr(self, '_last_mode', 'default'),
@@ -620,7 +633,7 @@ class AgentMagic(Magics):
                 "one-line question. Output just the ```json block with a \"decision_gate\" "
                 "field — no other text, no code.]\n\nPrevious reply:\n" + text[:2000]
             )
-            raw, interrupted = self._stream_with_interrupt(directive)
+            raw, interrupted = self._stream_with_interrupt(directive, silent=True)
             if interrupted or not raw.strip():
                 return None
             return parse(raw).decision_gate
