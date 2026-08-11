@@ -180,6 +180,230 @@ exports.STYLES = `
   justify-content: space-between;
 }
 
+/* ---- agent action bar ---- */
+.skillbot-action-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 12px;
+  background: ${exports.CC.bg};
+  border-top: 1px solid ${exports.CC.border};
+}
+.skillbot-action-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  background: ${exports.CC.surface};
+  color: ${exports.CC.inactive};
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+  user-select: none;
+  border: 1px solid ${exports.CC.border};
+  transition: background 0.12s, color 0.12s, border-color 0.12s, transform 0.08s;
+}
+.skillbot-action-btn:hover {
+  color: ${exports.CC.text};
+  background: #3a3a3a;
+  border-color: #454545;
+}
+.skillbot-action-btn:active {
+  transform: translateY(1px);
+}
+.skillbot-action-stop {
+  color: ${exports.CC.error};
+  border-color: rgba(255,107,128,0.4);
+}
+.skillbot-action-stop:hover {
+  color: #fff;
+  background: ${exports.CC.error};
+  border-color: ${exports.CC.error};
+}
+.skillbot-action-skills.active {
+  color: ${exports.CC.text};
+  background: rgba(0,180,180,0.15);
+  border-color: ${exports.CC.accent};
+}
+.skillbot-action-skills.active:hover {
+  background: rgba(0,180,180,0.25);
+}
+.skillbot-action-plan.active {
+  color: ${exports.CC.text};
+  background: rgba(0,102,102,0.25);
+  border-color: rgb(0,102,102);
+}
+.skillbot-action-plan.active:hover {
+  background: rgba(0,102,102,0.4);
+}
+.skillbot-action-btn.disabled {
+  opacity: 0.4;
+  cursor: default;
+  pointer-events: none;
+}
+
+/* ---- session switcher (vertical list) ---- */
+.skillbot-session-bar {
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid ${exports.CC.border};
+  background: ${exports.CC.bg};
+  max-height: 240px;
+}
+.skillbot-session-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px 6px 12px;
+}
+.skillbot-session-titlewrap {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  min-width: 0;
+}
+.skillbot-session-chevron {
+  font-size: 10px;
+  color: ${exports.CC.subtle};
+  transition: color 0.12s;
+}
+.skillbot-session-titlewrap:hover .skillbot-session-chevron,
+.skillbot-session-titlewrap:hover .skillbot-session-title {
+  color: ${exports.CC.text};
+}
+.skillbot-session-bar.collapsed {
+  max-height: none;
+}
+.skillbot-session-bar.collapsed .skillbot-session-header {
+  padding-bottom: 8px;
+}
+.skillbot-session-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: ${exports.CC.subtle};
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.skillbot-session-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.skillbot-session-btn {
+  padding: 3px 10px;
+  border-radius: 6px;
+  background: ${exports.CC.surface};
+  color: ${exports.CC.inactive};
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  user-select: none;
+  border: 1px solid transparent;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.skillbot-session-btn:hover {
+  color: ${exports.CC.text};
+  background: #3a3a3a;
+}
+.skillbot-session-btn-primary {
+  color: ${exports.CC.brand};
+  border-color: rgba(215,119,87,0.35);
+}
+.skillbot-session-btn-primary:hover {
+  color: #fff;
+  background: ${exports.CC.brand};
+  border-color: ${exports.CC.brand};
+}
+.skillbot-session-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 2px 8px 8px 8px;
+  overflow-y: auto;
+}
+.skillbot-session-list::-webkit-scrollbar { width: 5px; }
+.skillbot-session-list::-webkit-scrollbar-thumb { background: ${exports.CC.subtle}; border-radius: 3px; }
+.skillbot-session-empty {
+  padding: 10px 8px;
+  font-size: 12px;
+  color: ${exports.CC.subtle};
+  text-align: center;
+}
+.skillbot-session-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  border-left: 2px solid transparent;
+  transition: background 0.12s;
+}
+.skillbot-session-row:hover {
+  background: ${exports.CC.surface};
+}
+.skillbot-session-row.active {
+  background: ${exports.CC.userBg};
+  border-left-color: ${exports.CC.accent};
+}
+.skillbot-session-dot {
+  flex-shrink: 0;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: ${exports.CC.subtle};
+}
+.skillbot-session-row.active .skillbot-session-dot {
+  background: ${exports.CC.accent};
+  box-shadow: 0 0 4px ${exports.CC.accent};
+}
+.skillbot-session-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  color: ${exports.CC.inactive};
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.skillbot-session-row.active .skillbot-session-name {
+  color: ${exports.CC.text};
+  font-weight: 500;
+}
+.skillbot-session-edit {
+  flex-shrink: 0;
+  font-size: 12px;
+  color: transparent;
+  cursor: pointer;
+  padding: 0 2px;
+  transition: color 0.12s;
+}
+.skillbot-session-row:hover .skillbot-session-edit {
+  color: ${exports.CC.subtle};
+}
+.skillbot-session-edit:hover {
+  color: ${exports.CC.accent};
+}
+.skillbot-session-del {
+  flex-shrink: 0;
+  font-size: 12px;
+  color: transparent;
+  cursor: pointer;
+  padding: 0 2px;
+  transition: color 0.12s;
+}
+.skillbot-session-row:hover .skillbot-session-del {
+  color: ${exports.CC.subtle};
+}
+.skillbot-session-del:hover {
+  color: ${exports.CC.error};
+}
+
 .skillbot-input-wrapper {
   display: flex;
   align-items: center;
