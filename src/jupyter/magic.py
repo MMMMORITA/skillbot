@@ -11,7 +11,7 @@ from enum import Enum, auto
 from IPython.core.magic import Magics, cell_magic, line_magic, magics_class
 
 from agent import AgentSession, SubAgentConfig
-from agent.prompt import PromptBuilder
+from agent.prompt import PromptBuilder, SECTIONS
 from chat import _AGENTS
 from hook import HookGroup, HookRegistry, HookEvent
 from jupyter.telemetry import get_recorder, SessionEventRecorder, set_recorder
@@ -124,6 +124,55 @@ def _panel_track_cell_delete(source: str) -> None:
         inst.ns.remove_cell(source)
 
 
+def _panel_save_conversation(nb_path: str, payload: str) -> None:
+    """Bridge: persist a notebook's conversation buffer to disk."""
+    from jupyter.conversation_store import save_conversation
+    save_conversation(nb_path, payload)
+
+
+def _panel_load_conversation(nb_path: str) -> None:
+    """Bridge: load a persisted conversation buffer and push it to the panel.
+
+    Emits a ``restore_conversation`` comm action the frontend listens for.
+    """
+    from jupyter.conversation_store import load_conversation
+    from jupyter.panel import send_to_panel
+    payload = load_conversation(nb_path)
+    if payload:
+        send_to_panel(None, "restore_conversation", path=nb_path, buffer=payload)
+
+
+def _panel_list_conversations() -> None:
+    """Bridge: push the list of persisted conversations to the panel switcher."""
+    from jupyter.conversation_store import list_conversations
+    from jupyter.panel import send_to_panel
+    send_to_panel(None, "conversation_list", sessions=list_conversations())
+
+
+def _panel_delete_conversation(nb_path: str) -> None:
+    """Bridge: delete a notebook's persisted conversation from disk.
+
+    Called when the user removes a session from the switcher, or when the
+    underlying .ipynb file is deleted in the file browser.
+    """
+    from jupyter.conversation_store import delete_conversation
+    delete_conversation(nb_path)
+
+
+def _panel_switch_notebook(nb_path: str) -> None:
+    """Bridge: the active notebook changed — give it its own agent conversation.
+
+    The backend AgentMagic is a kernel-wide singleton with a single LLM session,
+    so switching/opening a notebook must reset the agent's conversation memory,
+    otherwise the new notebook inherits the previous one's history. Note this
+    resets *LLM memory* only; the kernel's Python namespace is shared across all
+    notebooks on the same kernel and cannot be per-notebook isolated.
+    """
+    inst = _get_magic()
+    if inst:
+        inst._handle_notebook_switch(nb_path)
+
+
 def _merge_prompt(claude_md_path: str | None = None) -> str:
     return PromptBuilder.main(claude_md_path)
 
@@ -168,6 +217,7 @@ class AgentMagic(Magics):
         self._last_plan_prompt = ""
         self._last_plan_output = ""
         self._last_plan_result = None                  # cached ParsedResult for _implement_plan
+        self._plan_cell_id = ""                        # notebook markdown cell holding the current plan
         self._pending_result = None                    # ParsedResult waiting for user confirmation
         self._agent_cells: dict[str, str] = {}     # cell_id → code, for auto-fix lookup
         self._round_results: list[dict] = []        # [{cell_id, code, output}] for auto-fix lookup
@@ -179,6 +229,7 @@ class AgentMagic(Magics):
         self._config_pending = None                 # pending (resolved, new_path, old_path)
         self._cell_restored = False                 # track if any cell was individually restored
         self._restoring_cells: set = set()          # cell_ids being restored, skip snapshot for these
+        self._session_nb_path = None                # notebook path the current agent session is bound to
 
         self._load_dotenv()
 
@@ -465,6 +516,40 @@ class AgentMagic(Magics):
             on_init=lambda s: _register_hooks(timeout, self._hook_cfg),
         )
 
+    def _handle_notebook_switch(self, nb_path: str) -> None:
+        """Active notebook changed — start a fresh agent conversation for it.
+
+        Resets the LLM session so the new notebook doesn't inherit the previous
+        one's conversation history. Kernel variables are shared and stay put.
+
+        Guards against spurious ``currentChanged`` events (tab focus, layout
+        restore) by only resetting when the notebook path actually differs from
+        the one the current session is bound to, and never mid-task.
+        """
+        prev = getattr(self, "_session_nb_path", None)
+        if prev == nb_path:
+            return  # same notebook — nothing to do
+        self._session_nb_path = nb_path
+        # First bind, or session never started → nothing to reset yet.
+        if prev is None or not self._session_ready:
+            return
+        # Don't yank the rug out from under a running task.
+        if self._state != AgentState.IDLE:
+            _log.info("notebook switch ignored — agent busy (state=%s)", self._state)
+            self._session_nb_path = prev  # keep binding until the task finishes
+            return
+        _log.info("notebook switch → resetting agent conversation (path=%s)", nb_path)
+        old = getattr(self, "_session", None)
+        if old is not None:
+            old.cleanup()
+        self._session_ready = False  # lazy re-init on next query
+        self._session_dirty = False
+        send_to_panel(
+            self.ns, "text",
+            content="⟳ new notebook — fresh agent conversation "
+                    "(kernel variables are shared across notebooks)\n",
+        )
+
     def _on_cell_run(self, result):
         info = getattr(result, "info", None)
         if info is None:
@@ -603,11 +688,11 @@ class AgentMagic(Magics):
 
         if mode == "plan":
             self._last_plan_prompt = prompt
-            plan_prefix = (
-                "[System: You are in plan mode. Explore the request, research the codebase, "
-                "and design an implementation approach. Present your plan as structured markdown. "
-                "Do NOT write or execute any code until the user confirms the plan.]\n\n"
-            )
+            # Hard plan constraint (SECTIONS["plan"]): forces the model to emit a
+            # non-empty "plan" field and an empty "code" array this turn, and to
+            # NOT run any tools — so the user reliably gets a plan first instead of
+            # the model jumping straight to exploration/code.
+            plan_prefix = "[System: " + SECTIONS["plan"] + "]\n\n"
             full = plan_prefix + full
 
         # Stream
@@ -633,6 +718,7 @@ class AgentMagic(Magics):
             self._last_plan_output = raw.strip()
             self._last_plan_result = result  # cache parsed result to avoid re-parse in _implement_plan
             plan_text = result.plan or result.text or ""
+            self._emit_plan_cell(plan_text)
             send_to_panel(self.ns, "plan_confirm", summary=plan_text)
             self._state = AgentState.PLAN_REVIEW
             self._busy = False
@@ -668,11 +754,13 @@ class AgentMagic(Magics):
         if session and session.client:
             mgr = session.client.skills
         else:
-            # Session not yet initialized — use SkillManager directly
+            # Session not yet initialized — use SkillManager directly.
+            # Resolve the dir for the CONFIGURED agent (not a hardcoded one),
+            # otherwise the panel shows another agent's (often empty) skills.
             try:
                 from chat.skill import SkillManager
                 from chat import _resolve_skill_dir
-                mgr = SkillManager(_resolve_skill_dir("claude-code"))
+                mgr = SkillManager(_resolve_skill_dir(self._agent))
             except Exception as e:
                 _log.warning("_handle_panel_skills: fallback SkillManager failed: %s", e)
 
@@ -1049,6 +1137,7 @@ class AgentMagic(Magics):
                 self._record_state("plan_confirm")
             self._last_plan_output = ""
             self._last_plan_result = None
+            self._plan_cell_id = ""  # keep confirmed plan cell in notebook; next plan starts fresh
             send_to_panel(self.ns, "result", summary="")
         elif arg == "accept_edits":
             if self._last_plan_result is not None:
@@ -1057,9 +1146,12 @@ class AgentMagic(Magics):
                 self._record_state("plan_confirm")
             self._last_plan_output = ""
             self._last_plan_result = None
+            self._plan_cell_id = ""  # keep confirmed plan cell in notebook; next plan starts fresh
             send_to_panel(self.ns, "result", summary="")
         elif arg == "no":
             self._last_plan_output = ""
+            self._last_plan_result = None
+            self._plan_cell_id = ""
             self._finish_agent_run("Plan cancelled")
         else:
             # Revision feedback
@@ -1067,7 +1159,11 @@ class AgentMagic(Magics):
             plan = self._last_plan_output or ""
             prompt = self._last_plan_prompt or ""
             if plan and prompt:
-                full = f"User feedback on the plan: {arg}\n\nOriginal request:\n{prompt}\n\nPrevious plan:\n{plan}\n\nRevise the plan based on the feedback."
+                full = (
+                    "[System: " + SECTIONS["plan"] + "]\n\n"
+                    f"User feedback on the plan: {arg}\n\nOriginal request:\n{prompt}\n\n"
+                    f"Previous plan:\n{plan}\n\nRevise the plan based on the feedback."
+                )
                 self._state = AgentState.STREAMING
                 self._busy = True
                 raw, interrupted = self._stream_with_interrupt(full)
@@ -1076,7 +1172,9 @@ class AgentMagic(Magics):
                 if raw.strip():
                     self._last_plan_output = raw.strip()
                     result = parse(raw)
+                    self._last_plan_result = result  # refresh cache so confirm implements the revised plan
                     plan_text = result.plan or result.text or ""
+                    self._emit_plan_cell(plan_text)
                     self._state = AgentState.PLAN_REVIEW
                     self._busy = False
                     send_to_panel(self.ns, "plan_confirm", summary=plan_text)
@@ -1159,11 +1257,31 @@ class AgentMagic(Magics):
             self._finish_agent_run("Auto-fix: no output")
             return
 
+    def _emit_plan_cell(self, plan_text: str) -> None:
+        """Render the plan as a notebook markdown cell so it is visible + confirmable
+        inside the notebook (not just the chat panel). Reuses the existing cell id
+        on revision so the plan cell is updated in place rather than duplicated."""
+        if not plan_text.strip():
+            return
+        content = "# %%plan\n\n" + plan_text
+
+        def _on_plan_cell(cid):
+            self._plan_cell_id = cid
+            self.ns._shell.user_ns["__plan_cell_id__"] = cid
+
+        from .render import render_code
+        render_code(self.ns, content, cell_type="markdown",
+                    replace_cell_id=self._plan_cell_id, on_cell_id=_on_plan_cell)
+
     def _implement_plan(self, plan: str, auto: bool = False,
                         preparsed_result=None) -> None:
         """Execute a confirmed plan: inject code blocks if present, or send as implementation prompt."""
         result = preparsed_result if preparsed_result is not None else parse(plan)
         _log.info("plan implement: %d code blocks, auto=%s", len(result.code_list), auto)
+
+        # Plan text is already shown as a markdown cell via _emit_plan_cell; drop it
+        # here so render_output only emits code cells (avoids a duplicate plan cell).
+        result.plan = ""
 
         self._agent_cells.clear()
         self._auto_fix_count = 0

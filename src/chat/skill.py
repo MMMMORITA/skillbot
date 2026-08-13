@@ -18,6 +18,14 @@ _log = logging.getLogger(__name__)
 _FRONTMATTER_RE = re.compile(r"^---\s*\r?\n(.*?)\r?\n---\s*(?:\r?\n|$)", re.DOTALL)
 _STATE_FILE = ".skill_state.json"
 
+# Skills are discovered recursively, so a categorized layout
+# (``<dir>/<category>/<skill>/SKILL.md``, e.g. hermes-agent) can hold dozens of
+# skills. Enabling every one by default would inject hundreds of thousands of
+# tokens of skill bodies into every message, so for *categorized* layouts only
+# these categories are enabled by default. Flat layouts (e.g. claude-code's
+# ``.claude/skills/<skill>/SKILL.md``) are unaffected and stay all-enabled.
+_DEFAULT_ENABLED_CATEGORIES = {"software-development"}
+
 
 def _clean_macos_junk(root: Path) -> None:
     """Remove macOS resource forks and __MACOSX dirs from extracted zip."""
@@ -51,6 +59,7 @@ class SkillManager:
     def __init__(self, skill_dir: str) -> None:
         self._dir = Path(skill_dir)
         self._disabled: set[str] = set()
+        self._enabled: set[str] = set()   # skills the user explicitly enabled (overrides default policy)
         self._load_state()
 
     # ------------------------------------------------------------------
@@ -65,14 +74,19 @@ class SkillManager:
         try:
             data = json.loads(self._state_path.read_text(encoding="utf-8"))
             self._disabled = set(data.get("disabled", []))
+            self._enabled = set(data.get("enabled", []))
         except Exception:
             self._disabled = set()
+            self._enabled = set()
 
     def _save_state(self) -> None:
         if not self._dir.is_dir():
             self._dir.mkdir(parents=True, exist_ok=True)
         self._state_path.write_text(
-            json.dumps({"disabled": sorted(self._disabled)}, indent=2),
+            json.dumps(
+                {"disabled": sorted(self._disabled), "enabled": sorted(self._enabled)},
+                indent=2,
+            ),
             encoding="utf-8",
         )
 
@@ -81,38 +95,132 @@ class SkillManager:
     # ------------------------------------------------------------------
 
     def list_skills(self) -> list[SkillInfo]:
-        """List all installed skills with enable status."""
+        """List all installed skills with enable status.
+
+        Discovery is recursive: both a flat layout
+        (``<dir>/<skill>/SKILL.md``) and a categorized one
+        (``<dir>/<category>/<skill>/SKILL.md``) are supported.
+        """
         skills: list[SkillInfo] = []
         if not self._dir.is_dir():
             return skills
-        for skill_dir in sorted(self._dir.iterdir()):
-            if not skill_dir.is_dir() or skill_dir.name.startswith("."):
-                continue
-            md = self._find_skill_md(skill_dir)
-            if md:
-                info = self._parse_skill(md)
-                if info:
-                    info.enabled = info.name not in self._disabled
-                    skills.append(info)
+        for md in self._discover_skill_mds():
+            info = self._parse_skill(md)
+            if info:
+                info.enabled = self._is_enabled(info.name, md)
+                skills.append(info)
+        skills.sort(key=lambda s: s.name.lower())
         return skills
 
+    def _discover_skill_mds(self) -> list[Path]:
+        """Recursively find every SKILL.md under the skill directory.
+
+        A directory that directly contains a SKILL.md is treated as a skill
+        root; recursion does not descend into it (skills don't nest inside
+        skills). Hidden dirs (``.git``, ``.skill_state.json`` parent, etc.) are
+        skipped.
+        """
+        found: list[Path] = []
+
+        def _walk(d: Path) -> None:
+            try:
+                entries = sorted(d.iterdir())
+            except Exception:
+                return
+            md = self._find_skill_md(d)
+            if md is not None:
+                found.append(md)
+                return  # this dir IS a skill — don't recurse into it
+            for e in entries:
+                if e.is_dir() and not e.name.startswith(".") and e.name != "__pycache__":
+                    _walk(e)
+
+        _walk(self._dir)
+        return found
+
+    def _is_enabled(self, name: str, md: Path) -> bool:
+        """Default-enable policy for a discovered skill.
+
+        Explicit user state in ``.skill_state.json`` always wins. For skills the
+        user hasn't touched:
+
+        * **Flat** layout (every skill sits directly under ``_dir``, e.g.
+          claude-code) → all enabled.
+        * **Categorized** layout (skills live under ``_dir/<category>/...``,
+          e.g. hermes-agent) → only skills whose top-level category is in
+          :data:`_DEFAULT_ENABLED_CATEGORIES` are enabled. A skill placed
+          directly under ``_dir`` in an otherwise-categorized tree (e.g.
+          ``yuanbao``) is treated as an uncategorized skill and left disabled,
+          so injection stays bounded.
+        """
+        if name in self._disabled:
+            return False
+        if name in self._enabled:
+            return True
+        # Not explicitly set by the user — apply default policy.
+        try:
+            rel = md.parent.relative_to(self._dir)
+        except Exception:
+            return True
+        parts = rel.parts
+        if not self._is_categorized():
+            return True  # flat layout → enable everything
+        if len(parts) <= 1:
+            return False  # uncategorized skill in a categorized tree → off by default
+        return parts[0] in _DEFAULT_ENABLED_CATEGORIES
+
+    def _is_categorized(self) -> bool:
+        """True if this skill dir uses a nested ``<category>/<skill>`` layout.
+
+        A layout is categorized if any discovered SKILL.md is more than one
+        level below ``_dir``. Cached per instance since the tree is static.
+        """
+        cached = getattr(self, "_categorized_cache", None)
+        if cached is not None:
+            return cached
+        result = False
+        for md in self._discover_skill_mds():
+            try:
+                if len(md.parent.relative_to(self._dir).parts) > 1:
+                    result = True
+                    break
+            except Exception:
+                continue
+        self._categorized_cache = result
+        return result
+
     def _find_skill_md(self, skill_dir: Path) -> Path | None:
-        """Find SKILL.md in a directory, case-insensitive."""
+        """Find SKILL.md directly inside a directory, case-insensitive."""
         if not skill_dir.is_dir():
             return None
-        for f in skill_dir.iterdir():
-            if f.is_file() and f.name.lower() == "skill.md":
-                return f
+        try:
+            for f in skill_dir.iterdir():
+                if f.is_file() and f.name.lower() == "skill.md":
+                    return f
+        except Exception:
+            return None
+        return None
+
+    def _find_skill_md_by_name(self, name: str) -> Path | None:
+        """Locate a skill's SKILL.md by its (unique) name, searching recursively."""
+        for md in self._discover_skill_mds():
+            info = self._parse_skill(md)
+            if info and info.name == name:
+                return md
+        # Fall back to directory-name match for skills without a name in frontmatter.
+        for md in self._discover_skill_mds():
+            if md.parent.name == name:
+                return md
         return None
 
     def get_skill(self, name: str) -> SkillInfo | None:
-        """Get a single skill by name."""
-        md = self._find_skill_md(self._dir / name)
+        """Get a single skill by name (recursive lookup)."""
+        md = self._find_skill_md_by_name(name)
         if not md:
             return None
         info = self._parse_skill(md)
         if info:
-            info.enabled = info.name not in self._disabled
+            info.enabled = self._is_enabled(info.name, md)
         return info
 
     # ------------------------------------------------------------------
@@ -188,11 +296,13 @@ class SkillManager:
 
     def uninstall(self, name: str) -> None:
         """Remove an installed skill."""
-        dest = self._dir / name
+        md = self._find_skill_md_by_name(name)
+        dest = md.parent if md else (self._dir / name)
         if not dest.is_dir():
             raise FileNotFoundError(f"skill not found: {name}")
         shutil.rmtree(dest)
         self._disabled.discard(name)
+        self._enabled.discard(name)
         self._save_state()
         _log.info("skill uninstalled: %s", name)
 
@@ -202,41 +312,31 @@ class SkillManager:
 
     def enable(self, name: str) -> None:
         """Enable a skill. Persisted to disk."""
-        if not self._find_skill_md(self._dir / name):
+        if not self._find_skill_md_by_name(name):
             raise FileNotFoundError(f"skill not installed: {name}")
         self._disabled.discard(name)
+        self._enabled.add(name)   # explicit override of the default-enable policy
         self._save_state()
         _log.info("skill enabled: %s", name)
 
     def disable(self, name: str) -> None:
         """Disable a skill. Persisted to disk."""
-        if not self._find_skill_md(self._dir / name):
+        if not self._find_skill_md_by_name(name):
             raise FileNotFoundError(f"skill not installed: {name}")
         self._disabled.add(name)
+        self._enabled.discard(name)
         self._save_state()
         _log.info("skill disabled: %s", name)
 
     @property
     def active_skills(self) -> list[str]:
         """Return enabled skill names."""
-        installed = set()
-        if self._dir.is_dir():
-            for skill_dir in self._dir.iterdir():
-                if skill_dir.is_dir() and not skill_dir.name.startswith("."):
-                    if self._find_skill_md(skill_dir):
-                        installed.add(skill_dir.name)
-        return sorted(installed - self._disabled)
+        return sorted(s.name for s in self.list_skills() if s.enabled)
 
     @property
     def disabled_skills(self) -> list[str]:
         """Return disabled skill names (only for currently installed skills)."""
-        installed = set()
-        if self._dir.is_dir():
-            for skill_dir in self._dir.iterdir():
-                if skill_dir.is_dir() and not skill_dir.name.startswith("."):
-                    if self._find_skill_md(skill_dir):
-                        installed.add(skill_dir.name)
-        return sorted(self._disabled & installed)
+        return sorted(s.name for s in self.list_skills() if not s.enabled)
 
     # ------------------------------------------------------------------
     # prompt injection

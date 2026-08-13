@@ -32,7 +32,7 @@ _AGENT_SKILL_PATHS: dict[str, str] = {
     "claude-code": ".claude/skills",
     "deer-flow": "skills/custom",
     "nanobot": "nanobot/skills",
-    "hermes-agent": "skills/custom",
+    "hermes-agent": "skills",
 }
 
 
