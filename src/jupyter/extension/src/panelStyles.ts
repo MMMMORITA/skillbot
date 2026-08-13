@@ -521,7 +521,7 @@ export const STYLES = `
   resize: vertical;
   min-height: 60px;
   outline: none;
-  border-r、adius: 2px;
+  border-radius: 2px;
   box-sizing: border-box;
 }
 .skillbot-confirm-feedback:focus {
