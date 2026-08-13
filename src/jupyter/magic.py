@@ -1,6 +1,7 @@
 """%%sql cell magic + agent panel integration — thin scheduling layer."""
 
 import hashlib
+import html
 import logging
 import os as _os
 import shlex
@@ -175,6 +176,24 @@ def _panel_switch_notebook(nb_path: str) -> None:
 
 def _merge_prompt(claude_md_path: str | None = None) -> str:
     return PromptBuilder.main(claude_md_path)
+
+
+def _build_kb_view_html() -> str:
+    """Load ``scripts/kb_view.py`` (not a package) and build the KB HTML view.
+
+    Imported lazily by the %kb_view magic so kernel startup stays cheap and the
+    heavy pygments/mistune render only runs on demand.
+    """
+    import importlib.util
+    from pathlib import Path
+
+    kb_path = Path(__file__).resolve().parents[2] / "scripts" / "kb_view.py"
+    if not kb_path.is_file():
+        raise FileNotFoundError(str(kb_path))
+    spec = importlib.util.spec_from_file_location("kb_view", kb_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.build_html()
 
 
 def _register_hooks(timeout: int, hook_cfg: dict) -> None:
@@ -1427,6 +1446,63 @@ class AgentMagic(Magics):
             self._jupyter_config_path = config_path
         summary = self._apply_config(resolved)
         render_info(f"agent: {self._agent}, timeout: {self._timeout}s [{summary}]")
+
+    # ---- %kb_view (line magic) ----
+
+    @line_magic("kb_view")
+    def kb_view_func(self, line: str) -> None:
+        """%kb_view [--height N] [--save PATH]
+
+        Render the risk-knowledge-base as a human-readable gallery inline.
+
+        The view is built from ``skills/risk-knowledge-base`` (manifest + docs)
+        and embedded in an isolated iframe via ``srcdoc`` so its global CSS does
+        not leak into the notebook DOM. Pass ``--save PATH`` to also write the
+        standalone HTML to disk.
+        """
+        from IPython.display import HTML, display
+
+        args = shlex.split(line)
+        height = pop_flag(args, "--height", convert=int) or 820
+        save_path = pop_flag(args, "--save")
+
+        try:
+            doc = _build_kb_view_html()
+        except FileNotFoundError as e:
+            render_error(f"[kb_view] not found: {e}")
+            return
+        except Exception as e:
+            render_error(f"[kb_view] failed to build view: {e}")
+            _log.exception("kb_view build failed")
+            return
+
+        if save_path:
+            from pathlib import Path
+            out = Path(save_path)
+            if not out.is_absolute():
+                out = Path(_os.getcwd()) / out
+            try:
+                out.write_text(doc, encoding="utf-8")
+                render_info(f"[kb_view] saved: {out}")
+            except OSError as e:
+                render_error(f"[kb_view] save failed: {e}")
+
+        srcdoc = html.escape(doc, quote=True)
+        # sandbox allows scripts (search/nav) + popups so the "原文 ↗" links can
+        # open the source Lark docs in a new tab; -to-escape-sandbox lets that
+        # new tab load normally instead of inheriting the sandbox restrictions.
+        # Wrapped in a <div> so the payload is not a bare <iframe>…</iframe> —
+        # IPython.display.HTML warns on that exact shape ("use IFrame instead"),
+        # but IFrame only supports src=URL, not the srcdoc we need for isolation.
+        display(HTML(
+            f'<div class="kb-view-wrap">'
+            f'<iframe srcdoc="{srcdoc}" '
+            f'style="width:100%;height:{height}px;border:1px solid #e8e8ef;'
+            f'border-radius:12px;" '
+            f'sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox">'
+            f'</iframe>'
+            f'</div>'
+        ))
 
     # ---- %sql / %%sql (line + cell magic) ----
 

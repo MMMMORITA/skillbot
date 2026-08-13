@@ -16,7 +16,7 @@
 | 4 | **运维/验证脚本**：plan 流确定性冒烟测试、本地/远程 kernel 执行器、跨实例护栏违规查看器 | ✅ 可用 | `scripts/verify_plan_flow.py`、`scripts/kexec.py`、`scripts/rexec.py`、`scripts/violations.py` | 2026-07-30 |
 | 5 | **容器 SG Hive 访问打通**：升级 bytedcli 到 0.116（装 `$HOME` 绕只读镜像层），SG `hive search` 走新 endpoint 返回 200 条；根因=容器版本旧（0.79）打废弃 endpoint，非鉴权/权限/legacy token 问题 | ✅ 已实测(容器) | `auth-script.sh`、`SG_HIVE_AUTH_HANDOFF.md` | 2026-08-04 |
 | 6 | **明文凭证止血 + .gitignore 加固**：TQS App key 明文（`mB19…/qKVR8…/P2me…/VcNl…`）全部替换为占位符；`.env.*` / `credentials.md` 加入忽略并 `git rm --cached` 停止跟踪；决策方案 1（每人各自申请 TQS App）落 HANDOFF §12/§13 | ✅ 已完成(代码侧) | `intelligent_skills/.gitignore`、`credentials.md`、`.env.sg`、`troubleshooting.md`、`SG_HIVE_AUTH_HANDOFF.md` | 2026-08-04 |
-| 7 | **风控知识库 skill + plan 只读放宽**：飞书「风控领域知识库」文档转 MD 封成 skill（纯 MD + Read/Grep 检索、无脚本）；同步放宽 `SECTIONS["plan"]` 为只读语义，让计划生成阶段能参考知识库提升准确度/完整度<br>**⚠️ 2026-08-12 返工**：按更权威的飞书设计文档(docx K2WUdXSlXowyadx1l28mJHVuyTe)重做——采 Anthropic Skills 渐进披露 + Karpathy LLM Wiki 范式，13 篇（补 TTS V4）每篇加 frontmatter(metrics/business_lines/summary)，新增 SCHEMA/index/log/manifest.json 五件套。**skill 名保持 `risk-knowledge-base`**（返工中曾临时命名 `fengkong-kb`，后统一改回，见 F-8）<br>**2026-08-12 收尾**：显式 enable 落盘 + 顶层 `skills/` 与 agent 加载目录双份物理拷贝（比对零差异后）合一为相对软链接，消除分叉风险（见 F-9） | ✅ 已验证(机制)：prompt 回归 + skill 发现/启用 + manifest 路由 + SQL 不切块 + 13 篇 frontmatter 合规 + 前端实测 + enable 落盘 + 软链接解析 | `src/agent/prompt.py`、`skills/risk-knowledge-base/*`、`agents/hermes-agent/skills/.skill_state.json` | 2026-08-12 |
+| 7 | **风控知识库 skill + plan 只读放宽**：飞书「风控领域知识库」文档转 MD 封成 skill（纯 MD + Read/Grep 检索、无脚本）；同步放宽 `SECTIONS["plan"]` 为只读语义，让计划生成阶段能参考知识库提升准确度/完整度<br>**⚠️ 2026-08-12 返工**：按更权威的飞书设计文档(docx K2WUdXSlXowyadx1l28mJHVuyTe)重做——采 Anthropic Skills 渐进披露 + Karpathy LLM Wiki 范式，13 篇（补 TTS V4）每篇加 frontmatter(metrics/business_lines/summary)，新增 SCHEMA/index/log/manifest.json 五件套。**skill 名保持 `risk-knowledge-base`**（返工中曾临时命名 `fengkong-kb`，后统一改回，见 F-8）<br>**2026-08-12 收尾**：显式 enable 落盘 + 顶层 `skills/` 与 agent 加载目录双份物理拷贝（比对零差异后）合一为相对软链接，消除分叉风险（见 F-9）<br>**2026-08-13 追加**：知识库「给人看」的可读视图——`scripts/kb_view.py` 产单文件离线 HTML（画廊+阅读页+搜索+SQL 高亮），`%kb_view` line magic 经 iframe srcdoc 隔离内联渲染进 Jupyter（见 F-10）；真机内核+浏览器双路径验证通过，并修复 iframe sandbox 缺 `allow-popups` 致「原文 ↗」新标签页被拦（见 F-10.1） | ✅ 已验证(机制+真机)：prompt 回归 + skill 发现/启用 + manifest 路由 + SQL 不切块 + 13 篇 frontmatter 合规 + 前端实测 + enable 落盘 + 软链接解析 + kb_view 真机内核执行 + 原文链接 popup 修复 | `src/agent/prompt.py`、`skills/risk-knowledge-base/*`、`agents/hermes-agent/skills/.skill_state.json`、`scripts/kb_view.py`、`src/jupyter/magic.py` | 2026-08-12 |
 
 > 状态说明：
 > - **已验证(机制)** = 通过确定性测试锁定控制流；**真实 LLM 输出稳定性需真机跑一轮确认**（模型行为不可 100% 保证）。
@@ -135,6 +135,24 @@
   - **先比对后动手**：`diff -rq` 两目录 `exit=0` 无差异输出；逐文件 SHA-256 交叉比对，**24 个文件哈希逐一相同**（含 6 个空 `.gitkeep` 均为空文件标准哈希 `e3b0c442…`）→ 内容零差异，替换安全。
   - **合一**：`rm -rf skills/risk-knowledge-base` 后建**相对软链接** `skills/risk-knowledge-base -> ../agents/hermes-agent/skills/custom/risk-knowledge-base`（相对路径利于仓库迁移）。验证：`readlink -f` 正确解析到 agent 下真实目录、透过链接可读出 `name: risk-knowledge-base`、目标实体完好。
   - **效果**：唯一物理实体在 agents 下（agent 实际加载处），顶层仅软链接指向，消除「改一份另一份不同步」的分叉风险；不影响任何现有加载逻辑。
+
+#### F-10. 【2026-08-13】知识库「给人看」的可读视图 + `%kb_view` magic
+
+**背景**：`risk-knowledge-base` 目前是给模型检索的纯 MD（渐进披露），但**人**要浏览具体内容只能逐个翻文件。用户要求在 agent 里做一个「人看的视图」——能直接看到 13 篇的标题/摘要/标签/正文，参考 MagiBook 风格的画廊 + 阅读页。
+
+- **新增 [scripts/kb_view.py](file:///Users/bytedance/Documents/trae_projects/skillbot/scripts/kb_view.py)**：读 `skills/risk-knowledge-base/manifest.json` + 13 篇 MD，产出**单文件离线 HTML**（内嵌 CSS/JS，零网络请求）。特性——左侧类别树（镜像 `NN_<类别>` 目录，含 6 个空占位）、MagiBook 风卡片画廊（标题/摘要/`doc_type` 徽章/标签）、点卡进阅读页（含指标/来源原文链接）、顶栏按标题+标签+摘要即时搜索、正文 SQL/代码经 pygments(monokai) 语法高亮。**零新增依赖**：复用已 vendored 的 mistune + pygments + stdlib。可 `--out` 存盘直接浏览器打开，或嵌 Jupyter。
+- **新增 `%kb_view` line magic**（[src/jupyter/magic.py](file:///Users/bytedance/Documents/trae_projects/skillbot/src/jupyter/magic.py#L1449-L1494)）：`%kb_view [--height N] [--save PATH]`。经 `importlib` 懒加载 `scripts/kb_view.py`（非包，按需构建，避免拖慢 kernel 启动）→ `build_html()` → 用 `html.escape` 后塞进 `<iframe srcdoc=... sandbox="allow-scripts">` **inline 渲染**。用 iframe srcdoc 隔离是关键：知识库的全局 CSS（`body`/`*` 选择器）不会泄漏污染 notebook DOM。`--save` 可另存独立 HTML，`--height` 调高度（默认 820px）。模块级 helper `_build_kb_view_html()`（[magic.py L180-195](file:///Users/bytedance/Documents/trae_projects/skillbot/src/jupyter/magic.py#L180-L195)）+ 顶部新增 `import html`。
+- **用法**：skillbot 内核里执行 `%kb_view` 即在 cell 下方内联出画廊；`%kb_view --save /tmp/kb.html` 另存后可浏览器打开。
+- **验证**：`ast.parse` 语法校验 magic.py PASS；`build_html()` 冒烟——输出 466KB HTML、含 monokai `.highlight` 样式；`html.escape(doc, quote=True)` 后 srcdoc 内**零裸双引号**（不会截断 iframe 属性）；`_build_kb_view_html` 路径解析（`magic.py` → `parents[2]/scripts/kb_view.py`）实测命中真实文件。**待真机**：Jupyter cell 内 iframe 实际渲染 + 搜索/切类/阅读交互手测。
+- **【2026-08-13 真机验证补记】**：上述「待真机」已闭环。走**双路径交叉验证**——(1) `nbconvert --execute` 用真实 **skillbot 内核**（内核 `bootstrap.py` 从 `src/` 加载扩展，与线上同路径）跑 `kb_view_verify.ipynb`：`exit=0`、零报错、`%kb_view` 产出合法 `<iframe srcdoc=...>`（651KB，仅一条无害 IPython「建议用 IFrame」warning）；(2) 浏览器打开 iframe 内嵌 HTML 截图核对——顶栏「风控知识库」+搜索框、左侧类别树（全部13/风控总览4/…含空占位）、卡片网格、点卡进阅读页（返回按钮+原文链接+正文）全部 PASS；body 内实测 **4 个** `<div class="highlight">` SQL 块（`#272822` monokai 背景、`<span class="k">select</span>` 着色）；搜索 `addEventListener('input')` 读 `data-search` 过滤逻辑经源码核对正确（浏览器自动化工具无法触发 JS input 事件，属工具局限非缺陷）。
+
+##### F-10.1 【2026-08-13】修复：阅读页「原文 ↗」链接点击无反应
+
+**现象**：用户在 Jupyter 里点阅读页的「原文 · docx ↗」没反应，怀疑没生成飞书链接。
+- **排查**：manifest 里 13 篇 `source_url` 全是完整飞书 https 绝对 URL，渲染出的 `<a>` 也都带 `target="_blank" rel="noopener"`（[kb_view.py L171-176](file:///Users/bytedance/Documents/trae_projects/skillbot/scripts/kb_view.py#L171-L176)）——**链接标记完全正确**。
+- **根因**：iframe 的 `sandbox="allow-scripts"` 只放行了 JS，**未给 `allow-popups`**。浏览器 sandbox 规则下 `target="_blank"` 新开标签页属 popup 行为，缺权限被**静默拦截** → 表现为「点了没反应」。之前浏览器验证是直开 `file://` 裸 HTML（无 sandbox）故未暴露，只有在 Jupyter sandbox iframe 里才复现。
+- **修复**（[magic.py L1490-1500](file:///Users/bytedance/Documents/trae_projects/skillbot/src/jupyter/magic.py#L1490-L1500)）：sandbox 改为 `allow-scripts allow-popups allow-popups-to-escape-sandbox`——`allow-popups` 放行新标签页，`-to-escape-sandbox` 让新开的飞书页不继承 sandbox 限制、能正常加载。仅加这三项（不加 `allow-same-origin`），CSS 隔离不受影响。
+- **验证**：`ast.parse` PASS；真机 skillbot 内核重跑 `%kb_view`，输出 iframe 已带 `sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"`；13 个 src-link 全为绝对 https + `target="_blank"`。**需用户操作**：浏览器 hard refresh（Cmd+Shift+R）+ 重启 kernel 重跑 `%kb_view` 后，点「原文 ↗」即新开标签页跳飞书原文。
 
 ---
 
