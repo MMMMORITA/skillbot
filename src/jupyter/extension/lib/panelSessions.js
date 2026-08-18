@@ -135,7 +135,9 @@ function registerSession(panel, path) {
     if (!path)
         return;
     const reg = loadRegistry(panel);
-    reg[path] = path.split('/').pop() || path;
+    if (!(path in reg)) {
+        reg[path] = path.split('/').pop() || path;
+    }
     saveRegistry(panel, reg);
     renderSessionBar(panel);
 }
@@ -168,16 +170,25 @@ function openNotebook(panel, path) {
 }
 /** Create a fresh Untitled.ipynb, open it, and switch the session to it. */
 async function newSession(panel) {
-    var _a, _b, _c, _d;
+    var _a, _b, _c, _d, _e;
     if (!panel._app)
         return;
     try {
         const cwd = ((_d = (_c = (_b = (_a = panel._tracker) === null || _a === void 0 ? void 0 : _a.currentWidget) === null || _b === void 0 ? void 0 : _b.context) === null || _c === void 0 ? void 0 : _c.path) === null || _d === void 0 ? void 0 : _d.split('/').slice(0, -1).join('/')) || '';
+        await panel._app.serviceManager.kernelspecs.ready;
+        const specs = panel._app.serviceManager.kernelspecs.specs;
+        if (!((_e = specs === null || specs === void 0 ? void 0 : specs.kernelspecs) === null || _e === void 0 ? void 0 : _e.skillbot)) {
+            throw new Error('skillbot kernelspec is not installed; run scripts/jupyter.sh setup');
+        }
         const model = await panel._app.serviceManager.contents.newUntitled({
             path: cwd,
             type: 'notebook',
         });
-        await panel._app.commands.execute('docmanager:open', { path: model.path });
+        await panel._app.commands.execute('docmanager:open', {
+            path: model.path,
+            factory: 'Notebook',
+            kernel: { name: 'skillbot' },
+        });
         registerSession(panel, model.path);
         switchToSession(panel, model.path);
     }

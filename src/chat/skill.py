@@ -24,7 +24,7 @@ _STATE_FILE = ".skill_state.json"
 # tokens of skill bodies into every message, so for *categorized* layouts only
 # these categories are enabled by default. Flat layouts (e.g. claude-code's
 # ``.claude/skills/<skill>/SKILL.md``) are unaffected and stay all-enabled.
-_DEFAULT_ENABLED_CATEGORIES = {"software-development"}
+_DEFAULT_ENABLED_CATEGORIES = {"software-development", "custom"}
 
 
 def _clean_macos_junk(root: Path) -> None:
@@ -53,7 +53,8 @@ class SkillManager:
     """Manage skills in a directory: list, install from .zip, uninstall.
 
     Enable/disable state is persisted in ``.skill_state.json`` inside the
-    skill directory.  All installed skills default to enabled.
+    skill directory. Explicit installs default to enabled; recursively
+    discovered categorized skills follow the category policy above.
     """
 
     def __init__(self, skill_dir: str) -> None:
@@ -173,7 +174,8 @@ class SkillManager:
         """True if this skill dir uses a nested ``<category>/<skill>`` layout.
 
         A layout is categorized if any discovered SKILL.md is more than one
-        level below ``_dir``. Cached per instance since the tree is static.
+        level below ``_dir``. The cache is invalidated when this manager mutates
+        the tree through install/uninstall.
         """
         cached = getattr(self, "_categorized_cache", None)
         if cached is not None:
@@ -284,11 +286,13 @@ class SkillManager:
             if dest.exists():
                 shutil.rmtree(dest)
             shutil.copytree(skill_root, dest)
+            self._categorized_cache = None
             _log.info("skill installed: %s (%d files)", name,
                        len(list(dest.rglob("*"))))
 
         # New skills default to enabled
-        self._disabled.discard(name)
+        self._disabled.discard(info.name)
+        self._enabled.add(info.name)
         self._save_state()
 
         return SkillInfo(name=info.name, description=info.description,
@@ -301,6 +305,7 @@ class SkillManager:
         if not dest.is_dir():
             raise FileNotFoundError(f"skill not found: {name}")
         shutil.rmtree(dest)
+        self._categorized_cache = None
         self._disabled.discard(name)
         self._enabled.discard(name)
         self._save_state()

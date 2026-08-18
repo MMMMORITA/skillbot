@@ -106,6 +106,23 @@ class TestListGet:
         assert mgr.list_skills() == []
         assert mgr.active_skills == []
 
+    def test_categorized_layout_enables_custom_skills(self, tmp_skill_dir):
+        root = Path(tmp_skill_dir) / "categorized"
+        custom = root / "custom" / "risk-knowledge-base"
+        research = root / "research" / "paper-search"
+        custom.mkdir(parents=True)
+        research.mkdir(parents=True)
+        (custom / "SKILL.md").write_text(
+            "---\nname: risk-knowledge-base\ndescription: Risk KB\n---\n\nBody."
+        )
+        (research / "SKILL.md").write_text(
+            "---\nname: paper-search\ndescription: Research\n---\n\nBody."
+        )
+
+        states = {s.name: s.enabled for s in SkillManager(str(root)).list_skills()}
+
+        assert states == {"paper-search": False, "risk-knowledge-base": True}
+
 # ============================================================================
 # enable / disable
 # ============================================================================
@@ -165,7 +182,7 @@ class TestPersistence:
         state = Path(tmp_skill_dir) / ".skill_state.json"
         assert state.is_file()
         data = json.loads(state.read_text())
-        assert data == {"disabled": ["test-skill"]}
+        assert data == {"disabled": ["test-skill"], "enabled": []}
 
     def test_corrupt_state_file_falls_back_to_empty(self, tmp_skill_dir):
         (Path(tmp_skill_dir) / ".skill_state.json").write_text("not json {{{")
@@ -267,6 +284,27 @@ class TestInstall:
         assert (Path(mgr._dir) / "with-refs" / "references" / "helper.py").is_file()
         assert (Path(mgr._dir) / "with-refs" / "references" / "data.csv").is_file()
 
+    def test_install_is_explicitly_enabled_in_categorized_layout(self, tmp_skill_dir):
+        root = Path(tmp_skill_dir) / "categorized-install"
+        existing = root / "software-development" / "existing"
+        existing.mkdir(parents=True)
+        (existing / "SKILL.md").write_text(
+            "---\nname: existing\ndescription: Existing\n---\n\nBody."
+        )
+        mgr = SkillManager(str(root))
+        data = _make_zip(
+            "installed",
+            "---\nname: installed\ndescription: Installed\n---\n\nBody.",
+        )
+        zip_path = root / "installed.zip"
+        zip_path.write_bytes(data)
+
+        info = mgr.install(str(zip_path))
+
+        assert info.enabled is True
+        assert mgr.get_skill("installed").enabled is True
+        assert SkillManager(str(root)).get_skill("installed").enabled is True
+
     def test_overwrite(self, mgr):
         data1 = _make_zip("overwrite", "---\nname: overwrite\ndescription: v1\n---\n\n# V1\n\nOld.")
         data2 = _make_zip("overwrite", "---\nname: overwrite\ndescription: v2\n---\n\n# V2\n\nNew.")
@@ -280,7 +318,7 @@ class TestInstall:
         s = mgr.get_skill("overwrite")
         assert "V2" in s.body
 
-    def test_overwrite_preserves_enabled(self, mgr, tmp_skill_dir):
+    def test_overwrite_preserves_enabled(self, mgr):
         data = _make_zip("overwrite", "---\nname: overwrite\ndescription: v1\n---\n\nBody.")
         p = Path(mgr._dir) / "ow.zip"
         p.write_bytes(data)

@@ -54,6 +54,7 @@ class AgentPanel extends widgets_1.Widget {
         this._killRing = ''; // for Ctrl+Y yank
         this._lastKill = ''; // track consecutive kill type for accumulation
         this._charsPerLine = 80; // computed from textarea width / monospace char width
+        this._topDotEl = null;
         this._statusTimer = null;
         this._execStartTime = 0;
         this._statusIcon = '○';
@@ -126,10 +127,14 @@ class AgentPanel extends widgets_1.Widget {
         const welcome = document.createElement('div');
         welcome.className = 'skillbot-welcome';
         welcome.innerHTML = `
-      <div style="font-size:14px;font-weight:600;color:${panelStyles_1.CC.text};margin-bottom:4px;">Agent Panel</div>
-      <div style="font-size:12px;font-weight:500;color:rgb(180,180,180);">Enter send · Shift+↵ newline · ↑↓ history · Shift+Tab mode · Ctrl+T thinking · Ctrl+C interrupt · /skills manage · /continue loop · /stop task</div>
+      <div class="skillbot-welcome-header">
+        <span class="skillbot-status-dot skillbot-status-dot--idle" id="skillbot-topdot"></span>
+        <span class="skillbot-welcome-title">Agent Panel</span>
+      </div>
+      <div class="skillbot-welcome-hint">Enter send · Shift+↵ newline · ↑↓ history · Shift+Tab mode · Ctrl+T thinking · Ctrl+C interrupt · /skills manage · /continue loop · /stop task</div>
     `;
         this._root.appendChild(welcome);
+        this._topDotEl = welcome.querySelector('#skillbot-topdot');
         // session switcher bar — one tab per known notebook conversation
         this._sessionBarEl = document.createElement('div');
         this._sessionBarEl.className = 'skillbot-session-bar';
@@ -219,7 +224,7 @@ class AgentPanel extends widgets_1.Widget {
         // Command dropdown
         this._commandDropdown = document.createElement('div');
         this._commandDropdown.className = 'skillbot-command-dropdown';
-        this._commandDropdown.style.cssText = `display:none;position:absolute;bottom:100%;left:0;right:0;background:${panelStyles_1.CC.bg};border:1px solid rgba(255,255,255,0.15);border-radius:4px;max-height:180px;overflow-y:auto;z-index:10;margin-bottom:2px;`;
+        this._commandDropdown.style.cssText = `display:none;position:absolute;bottom:100%;left:0;right:0;max-height:180px;overflow-y:auto;z-index:10;margin-bottom:4px;`;
         this._inputWrapper.style.position = 'relative';
         this._inputWrapper.appendChild(this._commandDropdown);
         this._commands = ['/confirm ', '/clear', '/continue ', '/mode ', '/skills ', '/config ', '/snapshot', '/stop'];
@@ -785,7 +790,7 @@ class AgentPanel extends widgets_1.Widget {
         this._commandDropdown.innerHTML = '';
         matches.forEach((cmd, i) => {
             const item = document.createElement('div');
-            item.style.cssText = `padding:3px 8px;font-size:12px;cursor:pointer;color:${panelStyles_1.CC.text};${i === this._commandIdx ? 'background:rgba(255,255,255,0.1);' : ''}`;
+            item.className = i === this._commandIdx ? 'skillbot-command-item active' : 'skillbot-command-item';
             item.textContent = cmd;
             item.addEventListener('click', () => { this._inputEl.value = cmd; this._inputEl.focus(); this._commandDropdown.style.display = 'none'; });
             this._commandDropdown.appendChild(item);
@@ -1183,7 +1188,19 @@ class AgentPanel extends widgets_1.Widget {
         else {
             this._statusEl.innerHTML = `<span>${icon} ${label}${q}</span><span>skillbot</span>`;
         }
+        this._updateTopDot(icon);
         this._syncActionBar();
+    }
+    /** Map the current status icon to the top-bar dot state modifier. */
+    _updateTopDot(icon) {
+        if (!this._topDotEl)
+            return;
+        const state = icon === '…' ? 'thinking' :
+            icon === '✓' ? 'done' :
+                icon === '⏏' ? 'interrupted' :
+                    icon === '⏸' ? 'plan' :
+                        'idle';
+        this._topDotEl.className = `skillbot-status-dot skillbot-status-dot--${state}`;
     }
     // ---- agent action bar ---------------------------------------------------
     /** Run a slash command from a button without disturbing the user's draft/history. */
@@ -1414,6 +1431,9 @@ class AgentPanel extends widgets_1.Widget {
     }
     connectKernel(kernel) {
         var _a, _b;
+        if (this._kernel && this._kernel !== kernel) {
+            this.resetComm();
+        }
         this._kernel = kernel;
         // Notify kernel of active notebook path for snapshot file isolation.
         // Must happen BEFORE `if (this._comm) return` so it fires on every
@@ -1523,8 +1543,9 @@ class AgentPanel extends widgets_1.Widget {
                         if (Array.isArray(d.sessions)) {
                             const reg = this._loadRegistry();
                             for (const s of d.sessions) {
-                                if (s.path)
+                                if (s.path && !(s.path in reg)) {
                                     reg[s.path] = s.path.split('/').pop() || s.path;
+                                }
                             }
                             this._saveRegistry(reg);
                             this._renderSessionBar();
@@ -1582,7 +1603,7 @@ function _jpBtn(text, kind) {
 }
 function _showSnapshotDialog(snapshots, panel, nb, cellRestored, nbPath) {
     const container = document.createElement('div');
-    container.style.cssText = 'min-width:520px;max-height:550px;overflow-y:auto;font-size:13px;color:#ddd;background:#1a1a2e;padding:12px;';
+    container.style.cssText = `min-width:520px;max-height:550px;overflow-y:auto;font-size:13px;color:${panelStyles_1.CC.text};background:${panelStyles_1.CC.bg};padding:12px;border-radius:10px;`;
     const title = document.createElement('div');
     title.style.cssText = 'font-weight:600;margin-bottom:10px;font-size:14px;';
     const label = nbPath || '(unsaved notebook)';
@@ -1590,19 +1611,19 @@ function _showSnapshotDialog(snapshots, panel, nb, cellRestored, nbPath) {
     container.appendChild(title);
     if (cellRestored) {
         const warning = document.createElement('div');
-        warning.style.cssText = 'padding:6px 8px;margin-bottom:10px;background:rgba(220,120,100,0.15);border-left:2px solid rgb(220,120,100);font-size:12px;color:rgb(220,160,140);';
+        warning.style.cssText = `padding:6px 8px;margin-bottom:10px;background:rgba(255,107,128,0.12);border-left:2px solid ${panelStyles_1.CC.error};border-radius:0 6px 6px 0;font-size:12px;color:rgb(255,160,175);`;
         warning.textContent = '⚠ Cells have been individually restored in this session. Notebook restore will overwrite those changes.';
         container.appendChild(warning);
     }
     let selectedId = '';
     const previewPanel = document.createElement('div');
-    previewPanel.style.cssText = 'background:#111;padding:10px;border-radius:4px;margin-top:10px;max-height:280px;overflow-y:auto;white-space:pre-wrap;font-family:monospace;font-size:12px;color:#ccc;line-height:1.5;';
+    previewPanel.style.cssText = `background:${panelStyles_1.CC.raised};padding:10px;border-radius:8px;margin-top:10px;max-height:280px;overflow-y:auto;white-space:pre-wrap;font-family:monospace;font-size:12px;color:${panelStyles_1.CC.inactive};line-height:1.5;`;
     previewPanel.textContent = 'Select a snapshot to preview';
     container.appendChild(previewPanel);
     const updateSelection = (s, row) => {
         selectedId = s.id;
         container.querySelectorAll('.snapshot-row').forEach((el) => el.style.background = '');
-        row.style.background = 'rgba(255,255,255,0.1)';
+        row.style.background = 'rgba(0,200,200,0.14)';
         // Show preview
         const previews = s.preview || [];
         if (previews.length > 0) {
@@ -1615,9 +1636,9 @@ function _showSnapshotDialog(snapshots, panel, nb, cellRestored, nbPath) {
     snapshots.forEach((s, i) => {
         const row = document.createElement('div');
         row.className = 'snapshot-row';
-        row.style.cssText = `padding:5px 10px;cursor:pointer;border-radius:3px;display:flex;justify-content:space-between;${i === 0 ? 'background:rgba(255,255,255,0.08);' : ''}`;
+        row.style.cssText = `padding:6px 10px;cursor:pointer;border-radius:6px;display:flex;justify-content:space-between;${i === 0 ? 'background:rgba(0,200,200,0.14);' : ''}`;
         const ts = new Date((s.timestamp || 0) * 1000).toLocaleString();
-        row.innerHTML = `<span style="font-size:13px;"><b>${ts}</b></span><span style="color:#999;font-size:12px;">${s.cells_count} cells</span>`;
+        row.innerHTML = `<span style="font-size:13px;"><b>${ts}</b></span><span style="color:${panelStyles_1.CC.subtle};font-size:12px;">${s.cells_count} cells</span>`;
         row.addEventListener('click', () => updateSelection(s, row));
         container.appendChild(row);
         if (i === 0) {
@@ -1701,14 +1722,14 @@ function _showCellSnapshotsDialog(cell, versions, panel) {
         return;
     }
     const container = document.createElement('div');
-    container.style.cssText = 'min-width:520px;max-height:550px;overflow-y:auto;font-size:13px;color:#ddd;background:#1a1a2e;padding:12px;';
+    container.style.cssText = `min-width:520px;max-height:550px;overflow-y:auto;font-size:13px;color:${panelStyles_1.CC.text};background:${panelStyles_1.CC.bg};padding:12px;border-radius:10px;`;
     const title = document.createElement('div');
     title.style.cssText = 'font-weight:600;margin-bottom:10px;font-size:14px;';
     title.textContent = `Cell Snapshots (${versions.length})`;
     container.appendChild(title);
     let selectedIdx = 0;
     const preview = document.createElement('div');
-    preview.style.cssText = 'background:#111;padding:10px;border-radius:4px;margin-top:10px;max-height:300px;overflow-y:auto;white-space:pre-wrap;font-family:monospace;font-size:12px;color:#ccc;line-height:1.5;';
+    preview.style.cssText = `background:${panelStyles_1.CC.raised};padding:10px;border-radius:8px;margin-top:10px;max-height:300px;overflow-y:auto;white-space:pre-wrap;font-family:monospace;font-size:12px;color:${panelStyles_1.CC.inactive};line-height:1.5;`;
     container.appendChild(preview);
     const updatePreview = (idx) => {
         const v = versions[idx];
@@ -1719,14 +1740,14 @@ function _showCellSnapshotsDialog(cell, versions, panel) {
     updatePreview(0);
     versions.forEach((v, i) => {
         const row = document.createElement('div');
-        row.style.cssText = `padding:5px 10px;cursor:pointer;border-radius:3px;display:flex;justify-content:space-between;${i === 0 ? 'background:rgba(255,255,255,0.1);' : ''}`;
+        row.style.cssText = `padding:6px 10px;cursor:pointer;border-radius:6px;display:flex;justify-content:space-between;${i === 0 ? 'background:rgba(0,200,200,0.14);' : ''}`;
         const ts = new Date((v.timestamp || 0) * 1000).toLocaleString();
         const code = (v.code || '').replace(/\n/g, ' ').substring(0, 80);
-        row.innerHTML = `<span style="font-size:13px;"><b>${v.version}</b> ${ts}</span><span style="color:#999;font-size:12px;">${_stripHtml(code)}</span>`;
+        row.innerHTML = `<span style="font-size:13px;"><b>${v.version}</b> ${ts}</span><span style="color:${panelStyles_1.CC.subtle};font-size:12px;">${_stripHtml(code)}</span>`;
         row.addEventListener('click', () => {
             selectedIdx = i;
             container.querySelectorAll('div[style]').forEach((el) => el.style.background = '');
-            row.style.background = 'rgba(255,255,255,0.1)';
+            row.style.background = 'rgba(0,200,200,0.14)';
             updatePreview(i);
         });
         container.appendChild(row);
@@ -1895,9 +1916,9 @@ exports.panelPlugin = {
                 catch (_) { }
                 const input = document.createElement('textarea');
                 input.placeholder = 'e.g. optimize query, fix bug, improve readability...';
-                input.style.cssText = 'width:100%;min-height:60px;background:#111;color:#ddd;border:1px solid #444;padding:8px;font-size:12px;resize:vertical;font-family:inherit;';
+                input.style.cssText = `width:100%;min-height:60px;background:${panelStyles_1.CC.raised};color:${panelStyles_1.CC.text};border:1px solid ${panelStyles_1.CC.border};border-radius:8px;padding:8px;font-size:12px;resize:vertical;font-family:inherit;box-sizing:border-box;`;
                 const hint = document.createElement('div');
-                hint.style.cssText = 'font-size:11px;color:rgb(140,140,140);margin-top:4px;';
+                hint.style.cssText = `font-size:11px;color:${panelStyles_1.CC.subtle};margin-top:4px;`;
                 hint.textContent = 'Enter → Optimize    Shift+Enter → Optimize & Run';
                 const body = new widgets_1.Widget();
                 body.node.appendChild(input);

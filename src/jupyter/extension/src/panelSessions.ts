@@ -105,7 +105,9 @@ export function saveRegistry(_panel: any, reg: Record<string, string>): void {
 export function registerSession(panel: any, path: string): void {
   if (!path) return;
   const reg = loadRegistry(panel);
-  reg[path] = path.split('/').pop() || path;
+  if (!(path in reg)) {
+    reg[path] = path.split('/').pop() || path;
+  }
   saveRegistry(panel, reg);
   renderSessionBar(panel);
 }
@@ -142,11 +144,20 @@ export async function newSession(panel: any): Promise<void> {
   if (!panel._app) return;
   try {
     const cwd = panel._tracker?.currentWidget?.context?.path?.split('/').slice(0, -1).join('/') || '';
+    await panel._app.serviceManager.kernelspecs.ready;
+    const specs = panel._app.serviceManager.kernelspecs.specs;
+    if (!specs?.kernelspecs?.skillbot) {
+      throw new Error('skillbot kernelspec is not installed; run scripts/jupyter.sh setup');
+    }
     const model = await (panel._app.serviceManager as any).contents.newUntitled({
       path: cwd,
       type: 'notebook',
     });
-    await panel._app.commands.execute('docmanager:open', { path: model.path });
+    await panel._app.commands.execute('docmanager:open', {
+      path: model.path,
+      factory: 'Notebook',
+      kernel: { name: 'skillbot' },
+    });
     registerSession(panel, model.path);
     switchToSession(panel, model.path);
   } catch (e) {

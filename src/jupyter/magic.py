@@ -196,6 +196,98 @@ def _build_kb_view_html() -> str:
     return mod.build_html()
 
 
+# ---------------------------------------------------------------------------
+# Gallery bridges — called from the left-hand SkillsGalleryWidget via
+# `get_ipython().user_ns['_gallery_*']()`, mirroring the `_panel_*` pattern.
+# ---------------------------------------------------------------------------
+
+def _gallery_skill_manager():
+    """Resolve a SkillManager for the configured agent (best effort)."""
+    inst = _get_magic()
+    session = getattr(inst, "_session", None) if inst else None
+    if session and getattr(session, "client", None):
+        return session.client.skills
+    try:
+        from chat.skill import SkillManager
+        from chat import _resolve_skill_dir
+        agent = getattr(inst, "_agent", None) or AgentMagic._agent
+        return SkillManager(_resolve_skill_dir(agent))
+    except Exception:
+        _log.debug("_gallery_skill_manager: failed", exc_info=True)
+        return None
+
+
+def _gallery_kb_manifest() -> list[dict]:
+    """Return lightweight KB doc metadata (no rendered bodies) for the list."""
+    import json as _json
+    from pathlib import Path
+
+    manifest = (
+        Path(__file__).resolve().parents[2]
+        / "skills" / "risk-knowledge-base" / "manifest.json"
+    )
+    if not manifest.is_file():
+        return []
+    items = _json.loads(manifest.read_text(encoding="utf-8"))
+    return [
+        {
+            # `docN` matches kb_view's per-doc id (same manifest ordering), so
+            # the gallery can deep-link straight to this card in the HTML view.
+            "id": f"doc{i}",
+            "title": it.get("title", ""),
+            "summary": it.get("summary", ""),
+            "category": it.get("category", ""),
+            "path": it.get("path", ""),
+            "source_url": it.get("source_url", ""),
+            "tags": it.get("tags", []),
+        }
+        for i, it in enumerate(items)
+    ]
+
+
+def _gallery_refresh() -> None:
+    """Push the skill list + KB manifest to the gallery widget."""
+    from .panel import send_to_gallery
+
+    mgr = _gallery_skill_manager()
+    if mgr:
+        try:
+            skills = [
+                {"name": s.name, "description": s.description, "enabled": s.enabled}
+                for s in mgr.list_skills()
+            ]
+        except Exception:
+            _log.debug("_gallery_refresh: list_skills failed", exc_info=True)
+            skills = []
+    else:
+        skills = []
+    send_to_gallery("gallery_skills", skills=skills)
+
+    try:
+        docs = _gallery_kb_manifest()
+    except Exception:
+        _log.debug("_gallery_refresh: kb manifest failed", exc_info=True)
+        docs = []
+    send_to_gallery("gallery_kb", docs=docs)
+
+
+def _gallery_kb_html(_path: str = "") -> None:
+    """Render the full KB HTML view and push it to the gallery for a new tab.
+
+    The view is one self-contained page; the frontend deep-links to the clicked
+    card via a postMessage handshake (``doc<N>`` ids), so ``_path`` is retained
+    only for logging/traceability.
+    """
+    from .panel import send_to_gallery
+
+    try:
+        doc = _build_kb_view_html()
+    except Exception:
+        _log.exception("_gallery_kb_html: build failed")
+        return
+    send_to_gallery("gallery_kb_html", html=doc, path=_path)
+
+
 def _register_hooks(timeout: int, hook_cfg: dict) -> None:
     cfg = hook_cfg or {}
     groups = cfg.get("groups", {})
@@ -249,6 +341,7 @@ class AgentMagic(Magics):
         self._cell_restored = False                 # track if any cell was individually restored
         self._restoring_cells: set = set()          # cell_ids being restored, skip snapshot for these
         self._session_nb_path = None                # notebook path the current agent session is bound to
+        self._pending_session_nb_path = None        # deferred switch requested while the agent is busy
 
         self._load_dotenv()
 
@@ -258,8 +351,9 @@ class AgentMagic(Magics):
         self._startup_config_msg = self._load_jupyter_config()
         self.ns.delta()
         shell.events.register("post_run_cell", self._on_cell_run)
-        from .panel import init_panel_comm
+        from .panel import init_panel_comm, init_gallery_comm
         init_panel_comm(shell)
+        init_gallery_comm(shell)
 
     # ---- state machine helpers -----------------------------------------------
 
@@ -273,6 +367,7 @@ class AgentMagic(Magics):
         self._auto_fix_count = 0
         self._pending_result = None
         self._round_results.clear()
+        self._apply_pending_notebook_switch()
         send_to_panel(self.ns, "text", content=msg)
         send_to_panel(self.ns, "result", summary="")
         send_to_panel(self.ns, "ready")
@@ -348,6 +443,7 @@ class AgentMagic(Magics):
         self._pending_result = None
         self._round_results.clear()
         self._agent_cells.clear()
+        self._apply_pending_notebook_switch()
         if msg:
             send_to_panel(self.ns, "text", content=f"{msg}\n")
         send_to_panel(self.ns, "result", summary="")
@@ -545,17 +641,28 @@ class AgentMagic(Magics):
         restore) by only resetting when the notebook path actually differs from
         the one the current session is bound to, and never mid-task.
         """
+        if self._state != AgentState.IDLE:
+            _log.info("notebook switch deferred — agent busy (state=%s)", self._state)
+            self._pending_session_nb_path = nb_path
+            return
+        self._switch_notebook_session(nb_path)
+
+    def _apply_pending_notebook_switch(self) -> None:
+        """Apply the latest notebook switch queued while an agent task was active."""
+        pending = getattr(self, "_pending_session_nb_path", None)
+        if not pending:
+            return
+        self._pending_session_nb_path = None
+        self._switch_notebook_session(pending)
+
+    def _switch_notebook_session(self, nb_path: str) -> None:
+        """Bind the backend session to *nb_path* while the agent is idle."""
         prev = getattr(self, "_session_nb_path", None)
         if prev == nb_path:
-            return  # same notebook — nothing to do
+            return
         self._session_nb_path = nb_path
         # First bind, or session never started → nothing to reset yet.
         if prev is None or not self._session_ready:
-            return
-        # Don't yank the rug out from under a running task.
-        if self._state != AgentState.IDLE:
-            _log.info("notebook switch ignored — agent busy (state=%s)", self._state)
-            self._session_nb_path = prev  # keep binding until the task finishes
             return
         _log.info("notebook switch → resetting agent conversation (path=%s)", nb_path)
         old = getattr(self, "_session", None)
