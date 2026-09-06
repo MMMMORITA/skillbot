@@ -290,6 +290,16 @@ _SCRIPT = """<script>
     c.addEventListener('click',function(){openDoc(c.getAttribute('data-id'));});
   });
 
+  // Deep-link: host (gallery widget) posts {type:'kb-open',id} to jump
+  // straight to a doc. srcdoc iframes have an opaque origin and no usable URL,
+  // so postMessage is the channel. We announce readiness so the host knows
+  // when its listener-then-send handshake can fire.
+  window.addEventListener('message',function(e){
+    var d=e.data||{};
+    if(d&&d.type==='kb-open'&&d.id) openDoc(d.id);
+  });
+  try{ (window.parent||window).postMessage({type:'kb-ready'},'*'); }catch(_){}
+
   function filterCat(cat){
     navItems.forEach(function(n){n.classList.toggle('active',n.getAttribute('data-cat')===cat);});
     document.querySelectorAll('.cat-section').forEach(function(s){

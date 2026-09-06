@@ -6,7 +6,7 @@ export function ensureResponsePrefix(panel: any): void {
     panel._responseStarted = true;
     const prefix = document.createElement('div');
     prefix.className = 'skillbot-response-prefix';
-    prefix.innerHTML = '  <span style="color:#888">⎿</span> ';
+    prefix.innerHTML = '<span class="skillbot-agent-avatar">✦</span><span class="skillbot-agent-name">skillbot</span>';
     panel._appendToBlock(prefix);
   }
 }
