@@ -176,6 +176,10 @@ _start() {
 
     export PYTHONPATH="${SRC}${PYTHONPATH:+:${PYTHONPATH}}"
     export IPYTHONDIR="${IPYTHON_PROFILE}"
+    # Keep the initial skill catalog compact. Set to 0 to restore full-body
+    # prompt injection; optional TOPK/RERANK controls can narrow it per request.
+    export SKILLBOT_PROGRESSIVE_SKILLS="${SKILLBOT_PROGRESSIVE_SKILLS:-1}"
+    echo "  progressive skills: ${SKILLBOT_PROGRESSIVE_SKILLS}"
     # ensure venv takes priority over system anaconda
     export PATH="${PROJECT_DIR}/.venv/bin:${PATH}"
     cd "${IPYTHON_PROFILE}/run"
