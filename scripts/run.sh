@@ -276,8 +276,12 @@ require_agent() {
 check_installed() {
     local agent="$1"
     if [[ "$agent" == "claude-code" ]]; then
-        if ! command -v claude &>/dev/null; then
-            echo "ERROR: claude not found. Run: install.sh install claude-code" >&2
+        if ! command -v claude &>/dev/null && \
+           ! "${VENV_PYTHON:-${PROJECT_DIR}/.venv/bin/python}" -c \
+               "import claude_agent_sdk; from pathlib import Path; assert (Path(claude_agent_sdk.__file__).parent / '_bundled' / 'claude').is_file()" \
+               2>/dev/null; then
+            echo "ERROR: Claude CLI not found globally or in claude-agent-sdk." >&2
+            echo "Run: install.sh init" >&2
             exit 1
         fi
         return 0
@@ -968,6 +972,10 @@ cmd_sync() {
             fi
         done
     fi
+
+    # Git placeholders are not runtime content and make conservative recursive
+    # search policies reject an otherwise readable skill tree.
+    find "$dest" -type f -name '.gitkeep' -delete
 
     echo ""
     echo "  result: $(_get_skills_list "$agent")"

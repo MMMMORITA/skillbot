@@ -16,8 +16,11 @@ SECTIONS = {
     "jupyter": (
         "Running inside a Jupyter notebook. Key rules:\n"
         "- Code for the user to see and run MUST go in the \"code\" field, NEVER executed via Bash.\n"
-        "- Use Bash for: file operations, data fetching, dependency installation, running tools.\n"
-        "- Save generated files (charts, CSVs) to /tmp/ — they will be loaded into the notebook.\n"
+        "- The runtime enforces execution permissions. Plan/default turns are read-only.\n"
+        "- Bash, native subagents and external tools are disabled. Return code for data fetching, "
+        "dependency installation and computation as notebook cells, subject to user approval.\n"
+        "- Direct Write/Edit tools are limited to the artifact directory named by the runtime, "
+        "and only on execute/auto turns. Never write configuration or credentials.\n"
         "- If the user needs to see output, return it in \"text\" — do not print to stdout via Bash."
     ),
     "magic": (
@@ -56,9 +59,9 @@ SECTIONS = {
     ),
     "tool_usage": (
         "Tool constraints:\n"
-        "- Bash(git:*), Bash(pip:*), Bash(curl:*) → setup and data fetching.\n"
-        "- Bash(python3:*) → generate files, never run interactive code.\n"
-        "- Write → only /tmp/ outputs that persist across tool calls.\n"
+        "- Read/Grep/Glob → only the runtime's configured read roots.\n"
+        "- Write/Edit → only the runtime's scoped artifact directory when authorized.\n"
+        "- Tool denials are authoritative; do not retry via another tool or delegate.\n"
         "- Never execute user-facing code — always return it in \"code\" field."
     ),
     "plan": (

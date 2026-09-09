@@ -24,6 +24,12 @@ def init_panel_comm(shell) -> None:
             from jupyter.magic import _get_magic
             inst = _get_magic()
             if inst:
+                workflow = getattr(inst, "_workflow", None)
+                if workflow is not None:
+                    comm.send(data={
+                        "action": "workflow_state",
+                        **workflow.snapshot.as_dict(),
+                    })
                 msg = getattr(inst, '_startup_config_msg', '')
                 if msg:
                     comm.send(data={"action": "text", "content": msg})

@@ -50,21 +50,6 @@ class TestRender:
             render_code(ns, "print(1)", auto=False)
             assert mock.call_args[1]["auto"] is False
 
-    def test_code_trace(self):
-        ns = Namespace(FakeShell())
-        with patch("jupyter.comm.send_cell_via_comm") as mock:
-            mock.return_value = True
-            render_code(ns, "print(1)", trace=True)
-            code = mock.call_args[0][1]
-            assert "%agent --trace" in code
-
-    def test_code_trace_auto(self):
-        ns = Namespace(FakeShell())
-        with patch("jupyter.comm.send_cell_via_comm") as mock:
-            mock.return_value = True
-            render_code(ns, "print(1)", auto=True, trace=True)
-            assert "%agent --trace --auto" in mock.call_args[0][1]
-
     def test_code_format_magic_prefix(self):
         ns = Namespace(FakeShell())
         with patch("jupyter.comm.send_cell_via_comm") as mock:
@@ -123,16 +108,6 @@ class TestRender:
             mock.return_value = True
             render_output(ns, ParsedResult(code_list=["a=1", "b=2"]))
             assert mock.call_count == 2
-
-    def test_multi_code_trace_last_only(self):
-        ns = Namespace(FakeShell())
-        with patch("jupyter.comm.send_cell_via_comm") as mock:
-            mock.return_value = True
-            render_output(ns, ParsedResult(code_list=["a=1", "b=2"]), trace=True)
-            # First call: no trace
-            assert "%agent --trace" not in mock.call_args_list[0][0][1]
-            # Second call: trace appended
-            assert "%agent --trace" in mock.call_args_list[1][0][1]
 
     def test_image_display(self):
         import base64

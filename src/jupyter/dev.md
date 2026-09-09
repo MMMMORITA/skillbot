@@ -78,11 +78,11 @@ Panel 交互流
   │   │       └── No, revise → 反馈文本域 → 修订 plan → 重新确认
   │   └── mode="auto" → render_output(auto=True) → 自动执行
   │       └── cell 错误 → _on_cell_run → _auto_fix_cell → AI 修复 → 替换 cell
-  ├── /continue yes|no → _handle_continue → 下一轮 / 停止
+  ├── /continue yes|no → _handle_continue → 执行待确认代码 / 停止
   └── /cell-optimize → _handle_cell_optimize → Agent 优化指定 cell → replace_cell_id
 
 AgentState 状态机（`magic.py:AgentState`）：
-  IDLE → STREAMING → WAITING_CONFIRM → /continue yes → STREAMING (loop)
+  IDLE → STREAMING → WAITING_CONFIRM → /continue yes → CELL_DISPATCHING
                    → PLAN_REVIEW → /confirm → STREAMING / WAITING_CONFIRM
                    → AUTO_FIXING (auto mode error) → STREAMING
   任意状态 + KeyboardInterrupt → _interrupt_cleanup() → IDLE
@@ -224,7 +224,7 @@ Shift+Tab 循环切换模式。模式切换时 info bar 显示随机提示（4s 
 Default 模式下 Agent 生成 cell 后弹出 Yes/No 确认按钮：
 - **Yes** → cell 注入 + 自动执行 → `_finish_agent_run`
 - **No** → 结束
-- Text-only 响应 → "Continue?" → Yes 继续对话，No 结束
+- Text-only 响应 → 直接结束本轮并恢复输入，不显示确认
 
 Plan 模式 confirm 后同 default 流程。
 Auto 模式跳过确认，直接注入+执行+自动修复。

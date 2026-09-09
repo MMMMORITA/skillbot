@@ -251,7 +251,6 @@ function purgeSession(panel, path) {
         panel._textEl = null;
         panel._thinkingEl = null;
         panel._streaming = false;
-        panel._busy = false;
     }
     renderSessionBar(panel);
 }

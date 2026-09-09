@@ -230,6 +230,10 @@ class ChatClient:
         """Interrupt the current streaming query."""
         self._backend.interrupt(session)
 
+    def prepare_run(self, session: str) -> dict | None:
+        """Prepare an out-of-band steering target when supported."""
+        return self._backend.prepare_run(session)
+
     @property
     def agent(self) -> str:
         return self._agent

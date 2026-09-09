@@ -58,19 +58,23 @@ def render_error(text: str) -> None:
         print(f"\033[91m{text}\033[0m", file=sys.stderr)
 
 
+def prepare_cell_code(code: str, cell_type: str = "code") -> str:
+    """Normalize generated code before it is materialized as a notebook Cell."""
+    code = code.strip()
+    if cell_type != "markdown":
+        if _is_sql(code) and not code.startswith("%%sql"):
+            code = f"%%sql\n{code}"
+        code = f"{code}\n# %%agent generate code"
+    return code
+
+
 def render_code(ns: Namespace, code: str, auto: bool = False,
                 cell_type: str = "code", replace_cell_id: str = "",
                 on_cell_id: callable | None = None) -> None:
     """Send code to frontend via comm; extension creates cell + optionally executes."""
     if not code:
         return
-    code = code.strip()
-    if cell_type == "markdown":
-        pass
-    else:
-        if _is_sql(code) and not code.startswith("%%sql"):
-            code = f"%%sql\n{code}"
-        code = f"{code}\n# %%agent generate code"
+    code = prepare_cell_code(code, cell_type)
 
     _log.info("render_code: %d chars auto=%s type=%s", len(code), auto, cell_type)
 
@@ -127,7 +131,8 @@ def render_sql_dataframe(ns: Namespace, data: dict, var_name: str):
 def render_output(ns: Namespace, result: ParsedResult,
                   skip_text: bool = False,
                   auto: bool = False, plan_cell_id: str = "",
-                  on_cell_id: callable | None = None) -> None:
+                  on_cell_id: callable | None = None,
+                  cell_submitter: callable | None = None) -> None:
     """Dispatch parsed agent result to render methods."""
     if result.text and not skip_text:
         if result.is_markdown:
@@ -167,8 +172,11 @@ def render_output(ns: Namespace, result: ParsedResult,
         HookRegistry.dispatch(HookEvent.CODE_REVIEW, context)
         result.code_list = context["code_list"]
 
-        for c in result.code_list:
-            render_code(ns, c, auto=auto, on_cell_id=on_cell_id)
+        if cell_submitter:
+            cell_submitter(result.code_list, auto)
+        else:
+            for c in result.code_list:
+                render_code(ns, c, auto=auto, on_cell_id=on_cell_id)
 
 
 # ---------------------------------------------------------------------------
@@ -231,5 +239,4 @@ def _display_image_file(name: str, content: str) -> None:
             render_text(f"[{name}] image display error")
     else:
         render_text(f"[{name}] image display skipped (empty content, file not found)")
-
 

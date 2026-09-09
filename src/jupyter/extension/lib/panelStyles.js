@@ -128,6 +128,17 @@ exports.STYLES = `
   white-space: pre-wrap;
   word-break: break-word;
 }
+.skillbot-prompt-refs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 5px;
+}
+.skillbot-prompt-ref {
+  color: ${exports.CC.accent};
+  font-size: 11px;
+  font-weight: 600;
+}
 
 /* ---- agent response ---- */
 .skillbot-response-prefix {
@@ -159,8 +170,46 @@ exports.STYLES = `
 }
 .skillbot-response-text {
   color: ${exports.CC.text};
-  white-space: pre-wrap;
   line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.skillbot-response-text p {
+  margin: 0 0 10px;
+}
+.skillbot-response-text p:last-child {
+  margin-bottom: 0;
+}
+.skillbot-response-text ul,
+.skillbot-response-text ol {
+  margin: 4px 0 10px;
+  padding-left: 24px;
+}
+.skillbot-response-text li {
+  margin: 2px 0;
+}
+.skillbot-response-text code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: ${exports.CC.raised};
+  color: ${exports.CC.brand};
+  font-family: inherit;
+}
+.skillbot-response-text pre {
+  margin: 8px 0;
+  padding: 10px 12px;
+  overflow-x: auto;
+  border: 1px solid ${exports.CC.border};
+  border-radius: 6px;
+  background: ${exports.CC.raised};
+  white-space: pre;
+}
+.skillbot-response-text pre code {
+  padding: 0;
+  background: transparent;
+  color: ${exports.CC.text};
+}
+.skillbot-response-text a {
+  color: ${exports.CC.accent};
 }
 
 .skillbot-tool-line {
@@ -495,6 +544,42 @@ exports.STYLES = `
   color: ${exports.CC.subtle};
 }
 .skillbot-session-del:hover {
+  color: ${exports.CC.error};
+}
+
+.skillbot-cell-references {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 7px 12px 2px;
+  background: ${exports.CC.surface};
+  border-top: 1px solid ${exports.CC.border};
+}
+.skillbot-cell-reference {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  padding: 4px 7px;
+  border: 1px solid rgba(0,200,200,0.35);
+  border-radius: 6px;
+  background: rgba(0,200,200,0.10);
+  color: ${exports.CC.accent};
+  font-size: 11px;
+  font-weight: 600;
+}
+.skillbot-cell-reference button {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: ${exports.CC.inactive};
+  cursor: pointer;
+  font: inherit;
+  line-height: 14px;
+}
+.skillbot-cell-reference button:hover {
   color: ${exports.CC.error};
 }
 
